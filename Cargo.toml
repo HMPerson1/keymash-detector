@@ -6,3 +6,7 @@ edition = "2024"
 [dependencies]
 autograd = "2.0.0-rc3"
 xsf = "0.3.5"
+wolfe_bfgs = "0.1.6"
+ndarray = "0.16.1"
+log = "*"
+env_logger = "0.11.8"

@@ -8,6 +8,8 @@ use ag::ndarray as na;
 use ag::ndarray::array;
 use ag::tensor_ops as op;
 
+use wolfe_bfgs::Bfgs;
+
 use xsf::log_ndtr;
 
 const HAND_BLOB_RADIUS_MIN: f64 = 1.;
@@ -15,7 +17,7 @@ const HAND_BLOB_LEN_STDDEV: f64 = 1.2;
 const HAND_BLOB_CLIFF: f64 = 3.;
 const KEYMASH_MISTAKE_P: f64 = 0.005;
 
-pub fn eval_model(input: &[u8], param_vals: na::ArrayView1<f64>) -> (f64, na::Array1<f64>) {
+pub fn fit_keymash_model(input: &[u8]) -> f64 {
     let input = input
         .into_iter()
         .map(|&x| {
@@ -27,7 +29,7 @@ pub fn eval_model(input: &[u8], param_vals: na::ArrayView1<f64>) -> (f64, na::Ar
         .map(f64::from) // wow type safety
         .collect::<Box<[_]>>();
 
-    let mut out_vals = ag::run::<f64, _, _>(|ctx| {
+    let opt_res = ag::run::<f64, _, _>(|ctx| {
         let rmin = op::scalar(HAND_BLOB_RADIUS_MIN, ctx);
         let char_kb_map = op::convert_to_tensor(na::arr2(&data::QWERTY_CHAR_KB_MAP_DATA_ARR), ctx);
         let input = op::convert_to_tensor(na::arr1(&input), ctx);
@@ -58,27 +60,53 @@ pub fn eval_model(input: &[u8], param_vals: na::ArrayView1<f64>) -> (f64, na::Ar
         let ret = ret + ((1. - KEYMASH_MISTAKE_P) / 2.).ln();
         let ret = logaddexp(ret, op::scalar(KEYMASH_MISTAKE_P.ln(), ctx), ctx);
         let ret = op::sum_all(ret);
-        let ret = op::neg(ret + llen_ll + rlen_ll);
+        let cost = op::neg(ret + llen_ll + rlen_ll);
 
-        let grad = op::grad(&[ret], &[params])[0];
+        let grad = op::grad(&[cost], &[params])[0];
 
-        ctx.evaluator()
-            .push(ret)
-            .push(grad)
-            .feed(params, param_vals)
-            .run()
-    })
-    .into_iter()
-    .collect::<Result<Vec<_>, _>>()
-    .unwrap();
+        Bfgs::new(
+            ndarray::array![1.75, 1.1, 4.75, 0.9, 1., 7.75, 0.9, 10.75, 1.1, 1.],
+            |param_val| {
+                let mut outs = ctx
+                    .evaluator()
+                    .push(cost)
+                    .push(grad)
+                    .feed(params, na::ArrayView1::from(param_val.as_slice().unwrap()))
+                    .run();
+                let out_grad = outs.pop().unwrap().unwrap();
+                let out_val = outs.pop().unwrap().unwrap();
 
-    let out_grad_vals = out_vals.pop().unwrap();
-    let out_ret_vals = out_vals.pop().unwrap();
+                (
+                    out_val
+                        .into_dimensionality::<na::Ix0>()
+                        .unwrap()
+                        .into_scalar(),
+                    ndarray::Array1::from_vec(out_grad.into_raw_vec()),
+                )
+            },
+        )
+        .run()
+    });
 
-    (
-        out_ret_vals.into_dimensionality::<na::Ix0>().unwrap().into_scalar(),
-        out_grad_vals.into_dimensionality::<na::Ix1>().unwrap(),
-    )
+    if let Err(e) = &opt_res {
+        log::warn!("Optimizer terminated with error: {}", e);
+    }
+
+    extract_soln(opt_res).map_or(f64::NEG_INFINITY, |x| -x.final_value)
+}
+
+fn extract_soln(
+    opt_res: Result<wolfe_bfgs::BfgsSolution, wolfe_bfgs::BfgsError>,
+) -> Option<wolfe_bfgs::BfgsSolution> {
+    match opt_res {
+        Ok(x) => Some(x),
+        Err(x) => match x {
+            wolfe_bfgs::BfgsError::LineSearchFailed { last_solution, .. } => Some(*last_solution),
+            wolfe_bfgs::BfgsError::MaxIterationsReached { last_solution } => Some(*last_solution),
+            wolfe_bfgs::BfgsError::GradientIsNaN => None,
+            wolfe_bfgs::BfgsError::StepSizeTooSmall => None,
+        },
+    }
 }
 
 fn mk_hand_blob<'g>(
