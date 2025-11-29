@@ -219,3 +219,27 @@ fn logaddexp<'a>(
         .append_input(y, false)
         .build(LogAddExp)
 }
+
+pub fn eval_english_model(input: &[u8]) -> f64 {
+    const PRB_SPACE: f64 = 0.05;
+    const PRB_MISTAKE: f64 = 0.01;
+
+    let mut ret = 0.;
+    let mut prev: &[f64; 26] = &data::ENGLISH_LETTER_FREQ;
+    for &c in input {
+        let (v, prev_n) = if b'a' <= c && c <= b'z' {
+            let c_i = (c - b'a') as usize;
+            (prev[c_i] + (-PRB_SPACE).ln_1p(), &data::ENGLISH_BIGRAM[c_i])
+        } else {
+            let v = if c == b' ' {
+                PRB_SPACE.ln()
+            } else {
+                f64::NEG_INFINITY
+            };
+            (v, &data::ENGLISH_LETTER_FREQ)
+        };
+        ret += xsf::logaddexp(v + (-PRB_MISTAKE).ln_1p(), PRB_MISTAKE.ln());
+        prev = prev_n;
+    }
+    return ret;
+}
