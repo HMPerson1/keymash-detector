@@ -1,5 +1,5 @@
 #[rustfmt::skip]
-pub const QWERTY_CHAR_KB_MAP_DATA_ARR: [[f64; 2]; 47] = [
+pub(crate) const QWERTY_CHAR_KB_MAP_DATA_ARR: [[f64; 2]; 47] = [
     [11.75,  1.  ],
     [ 9.25,  0.  ],
     [11.  ,  3.  ],
@@ -49,7 +49,9 @@ pub const QWERTY_CHAR_KB_MAP_DATA_ARR: [[f64; 2]; 47] = [
     [ 2.25,  0.  ],
 ];
 
-pub const ASCII_KB_MAP: [i8; 128] = [
+pub(crate) const QWERTY_CHAR_KB_MAP_DATA_ARR_LEN: i8 = QWERTY_CHAR_KB_MAP_DATA_ARR.len() as i8;
+
+pub(crate) const ASCII_KB_MAP: [i8; 128] = [
     -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
     -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, -1, -1, -1, -1, 1, 2, 3, 4, 5,
     6, 7, 8, 9, 10, 11, 12, 13, 14, -1, 15, -1, 16, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
@@ -59,7 +61,7 @@ pub const ASCII_KB_MAP: [i8; 128] = [
 ];
 
 #[rustfmt::skip]
-pub const ENGLISH_BIGRAM: [[f64; 26]; 26] = bytemuck::must_cast::<[[u64; _]; _],_>([
+pub(crate) const ENGLISH_BIGRAM: [[f64; 26]; 26] = bytemuck::must_cast::<[[u64; _]; _],_>([
     [0xc014293bc6c7df0b, 0xc00f2e24352906c4, 0xc0096fa56e05219d,
      0xc00a794363ee9b50, 0xc01658e4ee0a9cfb, 0xc010e179473f87a6,
      0xc00e5c43df0029f6, 0xc0158c9dfdaf0f9e, 0xc00c087422e66695,
@@ -296,7 +298,7 @@ pub const ENGLISH_BIGRAM: [[f64; 26]; 26] = bytemuck::must_cast::<[[u64; _]; _],
      0xc00d788f3738d472, 0xc012668fb9b88648]
 ]);
 
-pub const ENGLISH_LETTER_FREQ: [f64; 26] = bytemuck::must_cast::<[u64; _], _>([
+pub(crate) const ENGLISH_LETTER_FREQ: [f64; 26] = bytemuck::must_cast::<[u64; _], _>([
     0xc003bd3f9bb3f891,
     0xc010bf4b78a3042b,
     0xc00b3c9c79ca9a34,

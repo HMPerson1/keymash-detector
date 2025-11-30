@@ -1,13 +1,11 @@
+use std::env;
+
 use keymash_detector::*;
 
 fn main() {
-    env_logger::builder().filter_level(log::LevelFilter::Trace).init();
-
-    dbg!(eval_english_model(b"asdfgh"));
-    dbg!(eval_english_model(b"tomato"));
-
-    dbg!(fit_keymash_model(b"asdfjkl;"));
-    dbg!(fit_keymash_model(b"12340987"));
-    dbg!(fit_keymash_model(b"ghionvr;jesdgvsrdnuojk;il"));
-    dbg!(fit_keymash_model(b"vcoeimwanrvaeciowmnkr"));
+    let input = env::args().skip(1).next().unwrap();
+    let input = preprocess(input.as_bytes());
+    assert!(input.iter().all(u8::is_ascii));
+    println!("{}", str::from_utf8(&input).unwrap());
+    println!("{}", fit_keymash_model(&input) - eval_english_model(&input));
 }

@@ -25,6 +25,7 @@ pub fn fit_keymash_model(input: &[u8]) -> f64 {
                 .get(usize::from(x))
                 .copied()
                 .unwrap_or(-1)
+                .rem_euclid(data::QWERTY_CHAR_KB_MAP_DATA_ARR_LEN + 1)
         })
         .map(f64::from) // wow type safety
         .collect::<Box<[_]>>();
@@ -241,5 +242,21 @@ pub fn eval_english_model(input: &[u8]) -> f64 {
         ret += xsf::logaddexp(v + (-PRB_MISTAKE).ln_1p(), PRB_MISTAKE.ln());
         prev = prev_n;
     }
+    return ret;
+}
+
+pub fn preprocess(input: &[u8]) -> Vec<u8> {
+    let mut ret = Vec::with_capacity(input.len());
+    if input.len() < 3 {
+        ret.extend_from_slice(input);
+    } else {
+        ret.extend_from_slice(&input[..2]);
+        for &c in &input[2..] {
+            if !(ret[ret.len() - 2] == ret[ret.len() - 1] && ret[ret.len() - 1] == c) {
+                ret.push(c);
+            }
+        }
+    }
+    ret.make_ascii_lowercase();
     return ret;
 }
