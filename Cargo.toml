@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+dfdx = "0.13.0"
 autograd = "2.0.0-rc3"
 xsf = "0.3.5"
 wolfe_bfgs = "0.1.6"

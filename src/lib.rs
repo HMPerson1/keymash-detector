@@ -17,8 +17,152 @@ const HAND_BLOB_LEN_STDDEV: f64 = 1.2;
 const HAND_BLOB_CLIFF: f64 = 3.;
 const KEYMASH_MISTAKE_P: f64 = 0.005;
 
-pub fn fit_keymash_model(input: &[u8]) -> f64 {
+pub fn fit_keymash_model2(input: &[u8], params: ndarray::Array1<f64>) -> f64 {
+    use dfdx::prelude::*;
+    // let params = ndarray::array![1.75, 1.1, 4.75, 0.9, 1., 7.75, 0.9, 10.75, 1.1, 1.];
+
     let input = input
+        .into_iter()
+        .map(|&x| {
+            data::ASCII_KB_MAP
+                .get(usize::from(x))
+                .copied()
+                .unwrap_or(-1)
+                .rem_euclid(data::QWERTY_CHAR_KB_MAP_DATA_ARR_LEN + 1) as usize
+        })
+        .collect::<Vec<_>>();
+
+    let dev = Cpu::default();
+    let char_kb_map = dev.tensor(data::QWERTY_CHAR_KB_MAP_DATA_ARR);
+
+    let params: Tensor<Rank1<10>, _, _> = dev.tensor(params.to_vec());
+    let g = params.alloc_grads();
+    let params = params.traced(g);
+
+    let l0: Tensor<Rank1<2>, _, _, _> = params.with_empty_tape().slice((0..2,)).realize();
+    let l1: Tensor<Rank1<2>, _, _, _> = params.with_empty_tape().slice((2..4,)).realize();
+    let lr: Tensor<Rank0, _, _, _> = params.with_empty_tape().select(dev.tensor(4));
+    let r0: Tensor<Rank1<2>, _, _, _> = params.with_empty_tape().slice((5..7,)).realize();
+    let r1: Tensor<Rank1<2>, _, _, _> = params.with_empty_tape().slice((7..9,)).realize();
+    let rr: Tensor<Rank0, _, _, _> = params.with_empty_tape().select(dev.tensor(9));
+
+    let lr = my_dfdx::logaddexp2(lr, dev.tensor(HAND_BLOB_RADIUS_MIN));
+    let rr = my_dfdx::logaddexp2(rr, dev.tensor(HAND_BLOB_RADIUS_MIN));
+
+    let (lh_map, llen_ll) = my_dfdx::mk_hand_blob(&dev, l0, l1, lr, char_kb_map.clone());
+    let (rh_map, rlen_ll) = my_dfdx::mk_hand_blob(&dev, r0, r1, rr, char_kb_map);
+
+    let len = input.len();
+    let input = dev.tensor((input, (len,)));
+
+    let ret = my_dfdx::logaddexp2(lh_map.gather(input.clone()), rh_map.gather(input));
+    let ret = ret + ((1. - KEYMASH_MISTAKE_P) / 2.).ln();
+    let tmp = dev.tensor(KEYMASH_MISTAKE_P.ln()).broadcast_like(&ret);
+    let ret = my_dfdx::logaddexp2(ret, tmp);
+    let ret = ret.sum();
+    let cost = -(ret + llen_ll + rlen_ll);
+
+    let cost_val = cost.array();
+    // dbg!(cost_val);
+    // let out_grads = cost.backward().get(&params);
+    // dbg!(out_grads.as_vec());
+
+    cost_val
+}
+
+mod my_dfdx {
+
+    use std::f64::consts::{FRAC_2_PI, PI};
+
+    use dfdx::prelude::*;
+    use xsf::log_ndtr;
+
+    use crate::{HAND_BLOB_CLIFF, HAND_BLOB_LEN_STDDEV};
+    pub fn mk_hand_blob<T: Tape<f64, Cpu> + std::fmt::Debug>(
+        dev: &Cpu,
+        p0: Tensor<Rank1<2>, f64, Cpu, T>,
+        p1: Tensor<Rank1<2>, f64, Cpu, T>,
+        r: Tensor<Rank0, f64, Cpu, T>,
+        char_kb_map: Tensor<Rank2<47, 2>, f64, Cpu, NoneTape>,
+    ) -> (Tensor<(usize,), f64, Cpu, T>, Tensor<Rank0, f64, Cpu, T>) {
+        let p10 = p1.with_empty_tape() - p0.with_empty_tape();
+        let l2 = p10.with_empty_tape().square().sum();
+        let p0map = p0.with_empty_tape().broadcast() - char_kb_map.clone();
+        let t = ((p0map.with_empty_tape() * -p10.with_empty_tape().broadcast())
+            .sum::<_, Axis<1>>()
+            / l2.with_empty_tape().broadcast())
+        .clamp(0, 1);
+        let hmap = ((t.broadcast::<Rank2<_, 2>, _>() * p10.broadcast() + p0map)
+            .square()
+            .sum::<_, Axis<1>>()
+            + 0.01)
+            .sqrt();
+        let hmap = norm_logcdf2((hmap - r.broadcast()) * -HAND_BLOB_CLIFF);
+        let hmap = hmap.with_empty_tape() - hmap.logsumexp().broadcast();
+        let len_ll =
+            norm_logpdf2((l2.sqrt() - 3.) / HAND_BLOB_LEN_STDDEV) - HAND_BLOB_LEN_STDDEV.ln();
+        let pos_ll = logaddexp2(
+            ([p0, p1].stack() - dev.tensor([7., 1.5]).broadcast::<_, Axis<0>>()).abs()
+                - dev.tensor([7.5, 2.]).broadcast::<_, Axis<0>>(),
+            dev.tensor(0.).broadcast(),
+        )
+        .negate()
+        .sum::<Rank0, _>();
+
+        // TODO: nightly whyyyyy
+        let hmap: Tensor<(usize,), _, _, _> = hmap.realize();
+
+        (
+            (hmap, dev.tensor([f64::NEG_INFINITY])).concat_along(Axis::<0>),
+            len_ll + pos_ll,
+        )
+    }
+
+    fn norm_logcdf2<S: dfdx::shapes::ConstShape, T: dfdx::tensor::Tape<f64, dfdx::tensor::Cpu>>(
+        x: dfdx::tensor::Tensor<S, f64, dfdx::tensor::Cpu, T>,
+    ) -> dfdx::tensor::Tensor<S, f64, dfdx::tensor::Cpu, T> {
+        let (x, t) = x.split_tape();
+        let y: Vec<_> = x.as_vec().iter().copied().map(log_ndtr).collect();
+        let y = x.device().tensor(y);
+        y.put_tape(t)
+        // TODO: rip gradients
+        // ((((x.with_empty_tape() + x.powi(3) * 0.044715) * FRAC_2_PI.sqrt()).tanh() + 1.) * 0.5).ln()
+    }
+
+    fn norm_logpdf2<S: dfdx::shapes::Shape, T: dfdx::tensor::Tape<f64, dfdx::tensor::Cpu>>(
+        x: dfdx::tensor::Tensor<S, f64, dfdx::tensor::Cpu, T>,
+    ) -> dfdx::tensor::Tensor<S, f64, dfdx::tensor::Cpu, T> {
+        -x.with_empty_tape() * x / 2. - (2. * PI).sqrt().ln()
+    }
+
+    pub fn logaddexp2<
+        S: dfdx::shapes::Shape,
+        T1: dfdx::tensor::Tape<f64, dfdx::tensor::Cpu> + dfdx::tensor::Merge<T2>,
+        T2: dfdx::tensor::Tape<f64, dfdx::tensor::Cpu>,
+    >(
+        a: dfdx::tensor::Tensor<S, f64, dfdx::tensor::Cpu, T1>,
+        b: dfdx::tensor::Tensor<S, f64, dfdx::tensor::Cpu, T2>,
+    ) -> dfdx::tensor::Tensor<S, f64, dfdx::tensor::Cpu, T1> {
+        let (a, t) = a.split_tape();
+        let y: Vec<_> = a
+            .as_vec()
+            .into_iter()
+            .zip(b.as_vec().into_iter())
+            .map(|(a, b)| xsf::logaddexp(a, b))
+            .collect();
+        let y = a.device().tensor((y, a.shape().clone())).realize();
+        y.put_tape(t)
+        // (a.exp() + b.exp()).ln()
+    }
+}
+
+fn stupid_precision_check(a: f64, b: f64) -> bool {
+    let (a, b) = if a <= b { (a, b) } else { (b, a) };
+    b.to_bits() - a.to_bits() <= 5
+}
+
+pub fn fit_keymash_model(input_: &[u8]) -> f64 {
+    let input = input_
         .into_iter()
         .map(|&x| {
             data::ASCII_KB_MAP
@@ -76,14 +220,16 @@ pub fn fit_keymash_model(input: &[u8]) -> f64 {
                     .run();
                 let out_grad = outs.pop().unwrap().unwrap();
                 let out_val = outs.pop().unwrap().unwrap();
-
-                (
-                    out_val
-                        .into_dimensionality::<na::Ix0>()
-                        .unwrap()
-                        .into_scalar(),
-                    ndarray::Array1::from_vec(out_grad.into_raw_vec()),
-                )
+                let out_val = out_val
+                    .into_dimensionality::<na::Ix0>()
+                    .unwrap()
+                    .into_scalar();
+                // dbg!("REF:");
+                // dbg!(&out_val);
+                // dbg!(&out_grad);
+                let other = fit_keymash_model2(input_, param_val.clone());
+                assert!(stupid_precision_check(out_val, other));
+                (out_val, ndarray::Array1::from_vec(out_grad.into_raw_vec()))
             },
         )
         .run()
