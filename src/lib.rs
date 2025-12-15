@@ -17,7 +17,7 @@ const HAND_BLOB_LEN_STDDEV: f64 = 1.2;
 const HAND_BLOB_CLIFF: f64 = 3.;
 const KEYMASH_MISTAKE_P: f64 = 0.005;
 
-pub fn fit_keymash_model2(input: &[u8], params: ndarray::Array1<f64>) -> f64 {
+pub fn fit_keymash_model2(input: &[u8], params: ndarray::Array1<f64>) -> (f64, Vec<f64>) {
     use dfdx::prelude::*;
     // let params = ndarray::array![1.75, 1.1, 4.75, 0.9, 1., 7.75, 0.9, 10.75, 1.1, 1.];
 
@@ -64,10 +64,10 @@ pub fn fit_keymash_model2(input: &[u8], params: ndarray::Array1<f64>) -> f64 {
 
     let cost_val = cost.array();
     // dbg!(cost_val);
-    // let out_grads = cost.backward().get(&params);
+    let out_grads = cost.backward().get(&params);
     // dbg!(out_grads.as_vec());
 
-    cost_val
+    (cost_val, out_grads.as_vec())
 }
 
 mod my_dfdx {
@@ -121,10 +121,17 @@ mod my_dfdx {
     fn norm_logcdf2<S: dfdx::shapes::ConstShape, T: dfdx::tensor::Tape<f64, dfdx::tensor::Cpu>>(
         x: dfdx::tensor::Tensor<S, f64, dfdx::tensor::Cpu, T>,
     ) -> dfdx::tensor::Tensor<S, f64, dfdx::tensor::Cpu, T> {
-        let (x, t) = x.split_tape();
-        let y: Vec<_> = x.as_vec().iter().copied().map(log_ndtr).collect();
-        let y = x.device().tensor(y);
-        y.put_tape(t)
+        let (x, mut tape) = x.split_tape();
+        let out: Vec<_> = x.as_vec().iter().copied().map(log_ndtr).collect();
+        let out = x.device().tensor(out);
+        let out2 = out.clone();
+        tape.add_backward_op(move |grads| {
+            let out_grad = grads.get(&out2);
+            let grad_x = grads.get_or_alloc_mut(&x)?;
+            grad_x.copy_from_slice(&((norm_logpdf2(x) - out2).exp() * out_grad).as_vec());
+            Ok(())
+        });
+        out.put_tape(tape)
         // TODO: rip gradients
         // ((((x.with_empty_tape() + x.powi(3) * 0.044715) * FRAC_2_PI.sqrt()).tanh() + 1.) * 0.5).ln()
     }
@@ -132,7 +139,7 @@ mod my_dfdx {
     fn norm_logpdf2<S: dfdx::shapes::Shape, T: dfdx::tensor::Tape<f64, dfdx::tensor::Cpu>>(
         x: dfdx::tensor::Tensor<S, f64, dfdx::tensor::Cpu, T>,
     ) -> dfdx::tensor::Tensor<S, f64, dfdx::tensor::Cpu, T> {
-        -x.with_empty_tape() * x / 2. - (2. * PI).sqrt().ln()
+        -x.square() / 2. - (2. * PI).sqrt().ln()
     }
 
     pub fn logaddexp2<
@@ -143,22 +150,45 @@ mod my_dfdx {
         a: dfdx::tensor::Tensor<S, f64, dfdx::tensor::Cpu, T1>,
         b: dfdx::tensor::Tensor<S, f64, dfdx::tensor::Cpu, T2>,
     ) -> dfdx::tensor::Tensor<S, f64, dfdx::tensor::Cpu, T1> {
-        let (a, t) = a.split_tape();
+        let (a, t1) = a.split_tape();
+        let (b, t2) = b.split_tape();
+        let mut tape = t1.merge(t2);
         let y: Vec<_> = a
             .as_vec()
             .into_iter()
             .zip(b.as_vec().into_iter())
             .map(|(a, b)| xsf::logaddexp(a, b))
             .collect();
-        let y = a.device().tensor((y, a.shape().clone())).realize();
-        y.put_tape(t)
+        let out = a.device().tensor((y, a.shape().clone())).realize();
+        let out2 = out.clone();
+        tape.add_backward_op(move |grads| {
+            let grad_out = grads.get(&out2);
+            let grad_a = grads.get_or_alloc_mut(&a)?;
+            let grad_a_val = (a - out2.clone()).exp() * grad_out.clone();
+            for (o, g) in grad_a.iter_mut().zip(grad_a_val.as_vec()) {
+                *o += g;
+            }
+            let grad_b = grads.get_or_alloc_mut(&b)?;
+            let grad_b_val = (b - out2).exp() * grad_out;
+            if grad_b.len() == 1 {
+                grad_b[0] += grad_b_val.sum::<Rank0, _>().array();
+            } else {
+                for (o, g) in grad_b.iter_mut().zip(grad_b_val.as_vec()) {
+                    *o += g;
+                }
+            }
+            Ok(())
+        });
+        out.put_tape(tape)
         // (a.exp() + b.exp()).ln()
     }
 }
 
-fn stupid_precision_check(a: f64, b: f64) -> bool {
-    let (a, b) = if a <= b { (a, b) } else { (b, a) };
-    b.to_bits() - a.to_bits() <= 5
+fn stupid_precision_check(a: f64, b: f64, tol: u64) -> bool {
+    let (mut a, mut b) = (a.to_bits() as i64, b.to_bits() as i64);
+    a ^= (((a >> 63) as u64) >> 1) as i64;
+    b ^= (((b >> 63) as u64) >> 1) as i64;
+    (b - a).unsigned_abs() <= tol
 }
 
 pub fn fit_keymash_model(input_: &[u8]) -> f64 {
@@ -227,8 +257,25 @@ pub fn fit_keymash_model(input_: &[u8]) -> f64 {
                 // dbg!("REF:");
                 // dbg!(&out_val);
                 // dbg!(&out_grad);
-                let other = fit_keymash_model2(input_, param_val.clone());
-                assert!(stupid_precision_check(out_val, other));
+                let (t_val, t_grad) = fit_keymash_model2(input_, param_val.clone());
+                assert!(
+                    stupid_precision_check(out_val, t_val, 5),
+                    "{} {}",
+                    out_val,
+                    t_val
+                );
+                for (&r, t) in out_grad.iter().zip(t_grad) {
+                    let r_exp = 10. - r.abs().log10() * 2.5;
+                    let t_exp = 10. - t.abs().log10() * 2.5;
+                    let p = r_exp.min(t_exp).clamp(10., 35.).exp2();
+                    assert!(
+                        stupid_precision_check(r, t, p as u64),
+                        "{} {} {}",
+                        r,
+                        t,
+                        p.log2()
+                    );
+                }
                 (out_val, ndarray::Array1::from_vec(out_grad.into_raw_vec()))
             },
         )
