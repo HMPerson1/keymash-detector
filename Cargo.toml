@@ -1,0 +1,6 @@
+[workspace]
+resolver = "3"
+members = ["keymash-detector-core", "keymash-detector-bot"]
+
+[profile.test]
+opt-level = 1

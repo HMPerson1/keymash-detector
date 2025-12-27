@@ -457,7 +457,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "keymash-detector"
+name = "keymash-detector-bot"
+version = "0.1.0"
+dependencies = [
+ "keymash-detector-core",
+]
+
+[[package]]
+name = "keymash-detector-core"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
