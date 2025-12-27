@@ -1,16 +1,7 @@
 mod data;
 
-use std::f64::consts::PI;
-
-use autograd as ag;
-
-use ag::ndarray as na;
-use ag::ndarray::array;
-use ag::tensor_ops as op;
-
-use wolfe_bfgs::Bfgs;
-
-use xsf::log_ndtr;
+use dfdx_core::prelude::*;
+use wolfe_bfgs::*;
 
 const HAND_BLOB_RADIUS_MIN: f64 = 1.;
 const HAND_BLOB_LEN_STDDEV: f64 = 1.2;
@@ -25,69 +16,47 @@ pub fn fit_keymash_model(input: &[u8]) -> f64 {
                 .get(usize::from(x))
                 .copied()
                 .unwrap_or(-1)
-                .rem_euclid(data::QWERTY_CHAR_KB_MAP_DATA_ARR_LEN + 1)
+                .rem_euclid(data::QWERTY_CHAR_KB_MAP_DATA_ARR_LEN + 1) as usize
         })
-        .map(f64::from) // wow type safety
-        .collect::<Box<[_]>>();
+        .collect::<Vec<_>>();
 
-    let opt_res = ag::run::<f64, _, _>(|ctx| {
-        let rmin = op::scalar(HAND_BLOB_RADIUS_MIN, ctx);
-        let char_kb_map = op::convert_to_tensor(na::arr2(&data::QWERTY_CHAR_KB_MAP_DATA_ARR), ctx);
-        let input = op::convert_to_tensor(na::arr1(&input), ctx);
+    let dev = Cpu::default();
+    let char_kb_map = dev.tensor(data::QWERTY_CHAR_KB_MAP_DATA_ARR);
 
-        let params = ctx.placeholder("params", &[10]);
+    let opt_res = Bfgs::new(
+        ndarray::array![1.75, 1.1, 4.75, 0.9, 1., 7.75, 0.9, 10.75, 1.1, 1.],
+        |params| {
+            let params: Tensor<Rank1<10>, _, _> = dev.tensor(params.to_vec());
+            let params = params.leaky_traced();
 
-        let (lh_map, llen_ll) = mk_hand_blob(
-            op::slice(params, &[0], &[2]),
-            op::slice(params, &[2], &[4]),
-            logaddexp(params.access_elem(4), rmin, ctx),
-            char_kb_map,
-            ctx,
-        );
+            let l0 = params.c().slice((0..2,)).realize::<Rank1<2>>();
+            let l1 = params.c().slice((2..4,)).realize::<Rank1<2>>();
+            let lr = params.c().select::<Rank0, _>(dev.tensor(4));
+            let r0 = params.c().slice((5..7,)).realize::<Rank1<2>>();
+            let r1 = params.c().slice((7..9,)).realize::<Rank1<2>>();
+            let rr = params.c().select::<Rank0, _>(dev.tensor(9));
 
-        let (rh_map, rlen_ll) = mk_hand_blob(
-            op::slice(params, &[5], &[7]),
-            op::slice(params, &[7], &[9]),
-            logaddexp(params.access_elem(9), rmin, ctx),
-            char_kb_map,
-            ctx,
-        );
+            let lr = logaddexp(lr, dev.tensor(HAND_BLOB_RADIUS_MIN));
+            let rr = logaddexp(rr, dev.tensor(HAND_BLOB_RADIUS_MIN));
 
-        let ret = logaddexp(
-            op::gather(lh_map, input, 0),
-            op::gather(rh_map, input, 0),
-            ctx,
-        );
-        let ret = ret + ((1. - KEYMASH_MISTAKE_P) / 2.).ln();
-        let ret = logaddexp(ret, op::scalar(KEYMASH_MISTAKE_P.ln(), ctx), ctx);
-        let ret = op::sum_all(ret);
-        let cost = op::neg(ret + llen_ll + rlen_ll);
+            let (lh_map, llen_ll) = mk_hand_blob(&dev, l0, l1, lr, char_kb_map.clone());
+            let (rh_map, rlen_ll) = mk_hand_blob(&dev, r0, r1, rr, char_kb_map.clone());
 
-        let grad = op::grad(&[cost], &[params])[0];
+            let len = input.len();
+            let input = dev.tensor((input.clone(), (len,)));
 
-        Bfgs::new(
-            ndarray::array![1.75, 1.1, 4.75, 0.9, 1., 7.75, 0.9, 10.75, 1.1, 1.],
-            |param_val| {
-                let mut outs = ctx
-                    .evaluator()
-                    .push(cost)
-                    .push(grad)
-                    .feed(params, na::ArrayView1::from(param_val.as_slice().unwrap()))
-                    .run();
-                let out_grad = outs.pop().unwrap().unwrap();
-                let out_val = outs.pop().unwrap().unwrap();
+            let ret = logaddexp(lh_map.gather(input.clone()), rh_map.gather(input));
+            let ret = ret + ((1. - KEYMASH_MISTAKE_P) / 2.).ln();
+            let tmp = dev.tensor(KEYMASH_MISTAKE_P.ln()).broadcast_like(&ret);
+            let ret = logaddexp(ret, tmp);
+            let cost = -(ret.sum() + llen_ll + rlen_ll);
 
-                (
-                    out_val
-                        .into_dimensionality::<na::Ix0>()
-                        .unwrap()
-                        .into_scalar(),
-                    ndarray::Array1::from_vec(out_grad.into_raw_vec()),
-                )
-            },
-        )
-        .run()
-    });
+            let cost_val = cost.array();
+            let out_grads = cost.backward().get(&params);
+            (cost_val, ndarray::Array1::from_vec(out_grads.as_vec()))
+        },
+    )
+    .run();
 
     if let Err(e) = &opt_res {
         log::warn!("Optimizer terminated with error: {}", e);
@@ -96,129 +65,113 @@ pub fn fit_keymash_model(input: &[u8]) -> f64 {
     extract_soln(opt_res).map_or(f64::NEG_INFINITY, |x| -x.final_value)
 }
 
-fn extract_soln(
-    opt_res: Result<wolfe_bfgs::BfgsSolution, wolfe_bfgs::BfgsError>,
-) -> Option<wolfe_bfgs::BfgsSolution> {
+fn extract_soln(opt_res: Result<BfgsSolution, BfgsError>) -> Option<BfgsSolution> {
     match opt_res {
         Ok(x) => Some(x),
         Err(x) => match x {
-            wolfe_bfgs::BfgsError::LineSearchFailed { last_solution, .. } => Some(*last_solution),
-            wolfe_bfgs::BfgsError::MaxIterationsReached { last_solution } => Some(*last_solution),
-            wolfe_bfgs::BfgsError::GradientIsNaN => None,
-            wolfe_bfgs::BfgsError::StepSizeTooSmall => None,
+            BfgsError::LineSearchFailed { last_solution, .. } => Some(*last_solution),
+            BfgsError::MaxIterationsReached { last_solution } => Some(*last_solution),
+            BfgsError::GradientIsNaN => None,
+            BfgsError::StepSizeTooSmall => None,
         },
     }
 }
 
-fn mk_hand_blob<'g>(
-    p0_: ag::Tensor<'g, f64>,
-    p1_: ag::Tensor<'g, f64>,
-    r: ag::Tensor<'g, f64>,
-    char_kb_map: ag::Tensor<'g, f64>,
-    ctx: &'g impl ag::prelude::AsGraph<f64>,
-) -> (ag::Tensor<'g, f64>, ag::Tensor<'g, f64>) {
-    let p0 = p0_.reshape(&[1, 2]);
-    let p1 = p1_.reshape(&[1, 2]);
-    let p10 = p1 - p0;
-    let l2 = op::sum_all(op::square(p10));
-    let t = op::reduce_sum((char_kb_map - p0) * p10, &[-1], false) / l2;
-    let t = op::clip(t, 0., 1.);
-    let hmap = char_kb_map - ((op::tile(t.reshape(&[-1, 1]), 1, 2) * p10) + p0);
-    let hmap = op::sqrt(op::reduce_sum(op::square(hmap), &[-1], false) + 0.01);
-    let hmap = norm_logcdf((r - hmap) * HAND_BLOB_CLIFF, ctx);
-    let hmap = hmap - op::reduce_logsumexp(hmap, 0, false);
-    let len_ll =
-        norm_logpdf((op::sqrt(l2) - 3.) / HAND_BLOB_LEN_STDDEV, ctx) - HAND_BLOB_LEN_STDDEV.ln();
-    // uuuhhh so i think the gradient of op::concat is wrong
-    let pos_ll0 = op::sum_all(op::neg(logaddexp(
-        op::abs(p0_ - op::convert_to_tensor(array![7., 1.5], ctx))
-            - op::convert_to_tensor(array![7.5, 2.], ctx),
-        op::scalar(0., ctx),
-        ctx,
-    )));
-    let pos_ll1 = op::sum_all(op::neg(logaddexp(
-        op::abs(p1_ - op::convert_to_tensor(array![7., 1.5], ctx))
-            - op::convert_to_tensor(array![7.5, 2.], ctx),
-        op::scalar(0., ctx),
-        ctx,
-    )));
-    return (
-        op::concat(&[hmap, op::scalar(f64::NEG_INFINITY, ctx).reshape(&[1])], 0),
-        len_ll + pos_ll0 + pos_ll1,
-    );
+trait WithEmptyTapeShort: WithEmptyTape + Sized {
+    /// Clones self and inserts a new empty tape into the clone
+    fn c(&self) -> Self {
+        self.with_empty_tape()
+    }
+}
+impl<T: WithEmptyTape> WithEmptyTapeShort for T {}
+
+fn mk_hand_blob<T: Tape<f64, Cpu> + std::fmt::Debug>(
+    dev: &Cpu,
+    p0: Tensor<Rank1<2>, f64, Cpu, T>,
+    p1: Tensor<Rank1<2>, f64, Cpu, T>,
+    r: Tensor<Rank0, f64, Cpu, T>,
+    char_kb_map: Tensor<Rank2<47, 2>, f64, Cpu, NoneTape>,
+) -> (Tensor<(usize,), f64, Cpu, T>, Tensor<Rank0, f64, Cpu, T>) {
+    let p10 = p1.c() - p0.c();
+    let l2 = p10.c().square().sum();
+    let p0map = p0.c().broadcast() - char_kb_map.clone();
+    let t =
+        ((p0map.c() * -p10.c().broadcast()).sum::<_, Axis<1>>() / l2.c().broadcast()).clamp(0, 1);
+    let hmap = ((t.broadcast::<Rank2<_, 2>, _>() * p10.broadcast() + p0map)
+        .square()
+        .sum::<_, Axis<1>>()
+        + 0.01)
+        .sqrt();
+    let hmap = norm_logcdf((hmap - r.broadcast()) * -HAND_BLOB_CLIFF);
+    let hmap = hmap.c() - hmap.logsumexp().broadcast();
+    let len_ll = norm_logpdf((l2.sqrt() - 3.) / HAND_BLOB_LEN_STDDEV) - HAND_BLOB_LEN_STDDEV.ln();
+    let pos_ll = logaddexp(
+        ([p0, p1].stack() - dev.tensor([7., 1.5]).broadcast::<_, Axis<0>>()).abs()
+            - dev.tensor([7.5, 2.]).broadcast::<_, Axis<0>>(),
+        dev.tensor(0.).broadcast(),
+    )
+    .negate()
+    .sum::<Rank0, _>();
+
+    // TODO: nightly whyyyyy
+    let hmap = hmap.realize::<(usize,)>();
+
+    (
+        (hmap, dev.tensor([f64::NEG_INFINITY])).concat_tensor_along(Axis),
+        len_ll + pos_ll,
+    )
 }
 
-fn norm_logcdf<'a>(
-    x: ag::Tensor<'a, f64>,
-    g: &'a impl ag::prelude::AsGraph<f64>,
-) -> ag::Tensor<'a, f64> {
-    struct NormLogCdf;
-    impl ag::op::Op<f64> for NormLogCdf {
-        fn compute(&self, ctx: &mut ag::op::ComputeContext<f64>) -> Result<(), ag::op::OpError> {
-            let ret = ctx.input(0).mapv(log_ndtr);
-            ctx.append_output(ret);
-            Ok(())
+fn norm_logcdf<S: Shape, T: Tape<f64, Cpu>>(x: Tensor<S, f64, Cpu, T>) -> Tensor<S, f64, Cpu, T> {
+    use dfdx_core::tensor_ops::*;
+    #[derive(Clone)]
+    struct NormLogCdfOp;
+    impl UnaryDerivative2<f64> for NormLogCdfOp {
+        type BackInpNeeded = Needed;
+        type BackOutNeeded = Needed;
+
+        #[inline(always)]
+        fn f(&self, x: &f64) -> f64 {
+            xsf::log_ndtr(*x)
         }
 
-        fn grad(&self, ctx: &mut ag::op::GradientContext<f64>) {
-            let g = op::exp(norm_logpdf(ctx.input(0), ctx.graph()) - ctx.output());
-            ctx.append_input_grad(Some(g * ctx.output_grad()));
+        #[inline(always)]
+        fn df(&self, x: &f64, f: &f64) -> f64 {
+            use std::f64::consts::PI;
+            (-x * x / 2. - (2. * PI).sqrt().ln() - f).exp()
         }
     }
-    ag::Tensor::builder(g)
-        .append_input(x, false)
-        .build(NormLogCdf)
+    try_unary_op2(NormLogCdfOp, x).unwrap()
 }
 
-fn norm_logpdf<'a>(
-    x: ag::Tensor<'a, f64>,
-    g: &'a impl ag::prelude::AsGraph<f64>,
-) -> ag::Tensor<'a, f64> {
-    struct NormLogPdf;
-    impl ag::op::Op<f64> for NormLogPdf {
-        fn compute(&self, ctx: &mut ag::op::ComputeContext<f64>) -> Result<(), ag::op::OpError> {
-            let ret = ctx.input(0).mapv(|x| -x * x / 2. - (2. * PI).sqrt().ln());
-            ctx.append_output(ret);
-            Ok(())
-        }
-
-        fn grad(&self, ctx: &mut ag::op::GradientContext<f64>) {
-            ctx.append_input_grad(Some(op::neg(ctx.input(0)) * ctx.output_grad()));
-        }
-    }
-    ag::Tensor::builder(g)
-        .append_input(x, false)
-        .build(NormLogPdf)
+fn norm_logpdf<S: Shape, T: Tape<f64, Cpu>>(x: Tensor<S, f64, Cpu, T>) -> Tensor<S, f64, Cpu, T> {
+    use std::f64::consts::PI;
+    -x.square() / 2. - (2. * PI).sqrt().ln()
 }
 
-fn logaddexp<'a>(
-    x: ag::Tensor<'a, f64>,
-    y: ag::Tensor<'a, f64>,
-    g: &'a impl ag::prelude::AsGraph<f64>,
-) -> ag::Tensor<'a, f64> {
-    struct LogAddExp;
-    impl ag::op::Op<f64> for LogAddExp {
-        fn compute(&self, ctx: &mut ag::op::ComputeContext<f64>) -> Result<(), ag::op::OpError> {
-            let x = ctx.input(0);
-            let y = ctx.input(1);
+fn logaddexp<S: Shape, T1: Tape<f64, Cpu> + Merge<T2>, T2: Tape<f64, Cpu>>(
+    a: Tensor<S, f64, Cpu, T1>,
+    b: Tensor<S, f64, Cpu, T2>,
+) -> Tensor<S, f64, Cpu, T1> {
+    use dfdx_core::tensor_ops::*;
+    #[derive(Clone, Debug)]
+    struct LogAddExpOp;
+    impl BinaryDerivative2<f64> for LogAddExpOp {
+        type BackLhsNeeded = Needed;
+        type BackRhsNeeded = Needed;
+        type BackOutNeeded = Needed;
 
-            let ret = ag::ndarray::Zip::from(x)
-                .and_broadcast(y)
-                .apply_collect(|&x, &y| xsf::logaddexp(x, y));
-            ctx.append_output(ret);
-            Ok(())
+        #[inline(always)]
+        fn f(&self, x: &f64, y: &f64) -> f64 {
+            xsf::logaddexp(*x, *y)
         }
 
-        fn grad(&self, ctx: &mut ag::op::GradientContext<f64>) {
-            let ans = ctx.output();
-            ctx.append_input_grad(Some(op::exp(ctx.input(0) - ans) * ctx.output_grad()));
-            ctx.append_input_grad(Some(op::exp(ctx.input(1) - ans) * ctx.output_grad()));
+        #[inline(always)]
+        fn df(&self, x: &f64, y: &f64, f: &f64) -> (f64, f64) {
+            ((x - f).exp(), (y - f).exp())
         }
     }
-    ag::Tensor::builder(g)
-        .append_input(x, false)
-        .append_input(y, false)
-        .build(LogAddExp)
+    try_binary_op2(LogAddExpOp, a, b).unwrap()
 }
 
 pub fn eval_english_model(input: &[u8]) -> f64 {

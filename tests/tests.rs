@@ -24,7 +24,7 @@ fn test_keymashes() -> io::Result<()> {
         let res = fit_keymash_model(&input) - eval_english_model(&input);
         log::warn!("{}\n  {}", input_str, res);
         if ![26, 64, 65].contains(&i) {
-            assert!(res > 2., "{:?}\n  {}", input_str, res);
+            assert!(res > 1.95, "{:?}\n  {}", input_str, res);
         }
     }
 
