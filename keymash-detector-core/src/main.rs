@@ -1,6 +1,6 @@
 use std::env;
 
-use keymash_detector::*;
+use keymash_detector_core::*;
 
 fn main() {
     let input = env::args().skip(1).next().unwrap();

@@ -1,6 +1,6 @@
 use std::{fs, io, sync::Once};
 
-use keymash_detector::*;
+use keymash_detector_core::*;
 
 static LOGGER_INIT: Once = Once::new();
 
