@@ -1,8 +1,7 @@
 mod data;
 
-use dfdx::prelude::*;
+use dfdx_core::prelude::*;
 use wolfe_bfgs::*;
-use xsf::log_ndtr;
 
 const HAND_BLOB_RADIUS_MIN: f64 = 1.;
 const HAND_BLOB_LEN_STDDEV: f64 = 1.2;
@@ -28,8 +27,7 @@ pub fn fit_keymash_model(input: &[u8]) -> f64 {
         ndarray::array![1.75, 1.1, 4.75, 0.9, 1., 7.75, 0.9, 10.75, 1.1, 1.],
         |params| {
             let params: Tensor<Rank1<10>, _, _> = dev.tensor(params.to_vec());
-            let g = params.alloc_grads();
-            let params = params.traced(g);
+            let params = params.leaky_traced();
 
             let l0 = params.c().slice((0..2,)).realize::<Rank1<2>>();
             let l1 = params.c().slice((2..4,)).realize::<Rank1<2>>();
@@ -119,29 +117,31 @@ fn mk_hand_blob<T: Tape<f64, Cpu> + std::fmt::Debug>(
     let hmap = hmap.realize::<(usize,)>();
 
     (
-        (hmap, dev.tensor([f64::NEG_INFINITY])).concat_along(Axis),
+        (hmap, dev.tensor([f64::NEG_INFINITY])).concat_tensor_along(Axis),
         len_ll + pos_ll,
     )
 }
 
-fn norm_logcdf<const M: usize, T: Tape<f64, Cpu>>(
-    x: Tensor<Rank1<M>, f64, Cpu, T>,
-) -> Tensor<Rank1<M>, f64, Cpu, T> {
-    let (x, mut tape) = x.split_tape();
-    let out: Vec<_> = x.as_vec().iter().copied().map(log_ndtr).collect();
-    let out = x.device().tensor(out);
-    let out2 = out.clone();
-    tape.add_backward_op(move |grads| {
-        // TODO: this is wrong if input is a broadcasted scalar
-        let out_grad = grads.get(&out2);
-        let grad_x = grads.get_or_alloc_mut(&x)?;
-        let grad_x_val = (norm_logpdf(x) - out2).exp() * out_grad;
-        for (o, g) in grad_x.iter_mut().zip(grad_x_val.as_vec()) {
-            *o += g;
+fn norm_logcdf<S: Shape, T: Tape<f64, Cpu>>(x: Tensor<S, f64, Cpu, T>) -> Tensor<S, f64, Cpu, T> {
+    use dfdx_core::tensor_ops::*;
+    #[derive(Clone)]
+    struct NormLogCdfOp;
+    impl UnaryDerivative2<f64> for NormLogCdfOp {
+        type BackInpNeeded = Needed;
+        type BackOutNeeded = Needed;
+
+        #[inline(always)]
+        fn f(&self, x: &f64) -> f64 {
+            xsf::log_ndtr(*x)
         }
-        Ok(())
-    });
-    out.put_tape(tape)
+
+        #[inline(always)]
+        fn df(&self, x: &f64, f: &f64) -> f64 {
+            use std::f64::consts::PI;
+            (-x * x / 2. - (2. * PI).sqrt().ln() - f).exp()
+        }
+    }
+    try_unary_op2(NormLogCdfOp, x).unwrap()
 }
 
 fn norm_logpdf<S: Shape, T: Tape<f64, Cpu>>(x: Tensor<S, f64, Cpu, T>) -> Tensor<S, f64, Cpu, T> {
@@ -153,38 +153,25 @@ fn logaddexp<S: Shape, T1: Tape<f64, Cpu> + Merge<T2>, T2: Tape<f64, Cpu>>(
     a: Tensor<S, f64, Cpu, T1>,
     b: Tensor<S, f64, Cpu, T2>,
 ) -> Tensor<S, f64, Cpu, T1> {
-    let (a, t1) = a.split_tape();
-    let (b, t2) = b.split_tape();
-    let mut tape = t1.merge(t2);
-    let y: Vec<_> = a
-        .as_vec()
-        .into_iter()
-        .zip(b.as_vec().into_iter())
-        .map(|(a, b)| xsf::logaddexp(a, b))
-        .collect();
-    let out = a.device().tensor((y, a.shape().clone()));
-    let out2 = out.clone();
-    tape.add_backward_op(move |grads| {
-        // TODO: this is wrong if either input is not contiguous
-        let grad_out = grads.get(&out2);
-        let grad_a = grads.get_or_alloc_mut(&a)?;
-        let grad_a_val = (a - out2.clone()).exp() * grad_out.clone();
-        for (o, g) in grad_a.iter_mut().zip(grad_a_val.as_vec()) {
-            *o += g;
+    use dfdx_core::tensor_ops::*;
+    #[derive(Clone, Debug)]
+    struct LogAddExpOp;
+    impl BinaryDerivative2<f64> for LogAddExpOp {
+        type BackLhsNeeded = Needed;
+        type BackRhsNeeded = Needed;
+        type BackOutNeeded = Needed;
+
+        #[inline(always)]
+        fn f(&self, x: &f64, y: &f64) -> f64 {
+            xsf::logaddexp(*x, *y)
         }
-        let grad_b = grads.get_or_alloc_mut(&b)?;
-        let grad_b_val = (b - out2).exp() * grad_out;
-        if grad_b.len() == 1 {
-            // hack for when b is a broadcasted scalar
-            grad_b[0] += grad_b_val.sum::<Rank0, _>().array();
-        } else {
-            for (o, g) in grad_b.iter_mut().zip(grad_b_val.as_vec()) {
-                *o += g;
-            }
+
+        #[inline(always)]
+        fn df(&self, x: &f64, y: &f64, f: &f64) -> (f64, f64) {
+            ((x - f).exp(), (y - f).exp())
         }
-        Ok(())
-    });
-    out.put_tape(tape)
+    }
+    try_binary_op2(LogAddExpOp, a, b).unwrap()
 }
 
 pub fn eval_english_model(input: &[u8]) -> f64 {
