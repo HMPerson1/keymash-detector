@@ -10,7 +10,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use twitch_highway::{
     TwitchAPI,
-    chat::ChatAPI,
+    chat::{ChatAPI, SendChatMessageResponse},
     eventsub::{
         EventSubAPI, SubscriptionType,
         events::chat::ChannelChatMessage,
@@ -31,7 +31,21 @@ struct RunState {
     api_app: TwitchAPI,
     api_user: TwitchAPI,
     me_user: UserId,
-    rooms: HashMap<BroadcasterId, (RoomConfig, AtomicBool)>,
+    rooms: HashMap<BroadcasterId, RoomRunState>,
+}
+
+struct RoomRunState {
+    has_bot_auth: AtomicBool,
+    duplicate_bypass_state: AtomicBool,
+}
+
+impl From<RoomConfig> for RoomRunState {
+    fn from(value: RoomConfig) -> Self {
+        Self {
+            has_bot_auth: AtomicBool::new(value.has_bot_auth),
+            duplicate_bypass_state: AtomicBool::new(false),
+        }
+    }
 }
 
 #[tokio::main]
@@ -165,7 +179,7 @@ async fn init() -> Result<RunState, Box<dyn std::error::Error>> {
         rooms: new_config
             .rooms
             .into_iter()
-            .map(|(k, v)| (k, (v, AtomicBool::new(false))))
+            .map(|(k, v)| (k, v.into()))
             .collect(),
     })
 }
@@ -202,31 +216,76 @@ async fn on_message(
     }
     tracing::debug!("recv chat in room {}: {}", room_id, event.message.text);
 
-    let duplicate_bypass_state = room_state.1.fetch_not(Ordering::SeqCst);
+    let duplicate_bypass_state = room_state.duplicate_bypass_state.load(Ordering::SeqCst);
     let mut msg = "auto reply spam test".to_string();
     if duplicate_bypass_state {
         // from 7tv "Bypass Duplicate Message Check"
         // chatterino apparently uses `'\u{E0000}'`
         msg.push_str(" \u{34f}");
     }
-    let api = if room_state.0.has_bot_auth {
-        &run_state.api_app
-    } else {
-        &run_state.api_user
+
+    let do_send_chat = async |api: &TwitchAPI| {
+        api.send_chat_message(room_id, &run_state.me_user, &msg)
+            .reply_parent_message_id(&event.message_id)
+            .json()
+            .await
     };
 
-    let response = api
-        .send_chat_message(room_id, &run_state.me_user, &msg)
-        .reply_parent_message_id(&event.message_id)
-        .json()
-        .await;
+    if room_state.has_bot_auth.load(Ordering::SeqCst) {
+        let response = do_send_chat(&run_state.api_app).await;
 
-    if let Ok(r) = &response
+        if is_send_chat_sent(&response) {
+            room_state
+                .duplicate_bypass_state
+                .fetch_not(Ordering::SeqCst);
+            tracing::debug!("chat reply sent as bot");
+            return;
+        }
+        tracing::warn!("failed to send chat as bot: {:?}", &response);
+        if !is_send_chat_failed_bot_auth(&response) {
+            // don't retry for other errors
+            return;
+        }
+        tracing::warn!("unsetting has_bot_auth and retrying...");
+        room_state.has_bot_auth.store(false, Ordering::SeqCst);
+        // fallthrough to `has_bot_auth == false`
+    }
+
+    let response = do_send_chat(&run_state.api_user).await;
+
+    if is_send_chat_sent(&response) {
+        room_state
+            .duplicate_bypass_state
+            .fetch_not(Ordering::SeqCst);
+        tracing::debug!("chat reply sent");
+    } else {
+        tracing::warn!("failed to send chat: {:?}", &response);
+    }
+}
+
+fn is_send_chat_sent(response: &Result<SendChatMessageResponse, twitch_highway::Error>) -> bool {
+    if let Ok(r) = response
         && let [r] = &r.data[..]
         && r.is_sent
     {
-        tracing::debug!("chat reply sent");
+        true
     } else {
-        tracing::warn!("failed to send chat: {:?}", response);
+        false
+    }
+}
+
+fn is_send_chat_failed_bot_auth(
+    response: &Result<SendChatMessageResponse, twitch_highway::Error>,
+) -> bool {
+    if let Err(e) = &response
+        && e.is_api()
+        && let Some(err_msg) = e.message()
+        // kinda jank but meh
+        && err_msg.contains("channel:bot scope")
+        && err_msg.contains("moderator")
+    {
+        true
+    } else {
+        false
     }
 }
