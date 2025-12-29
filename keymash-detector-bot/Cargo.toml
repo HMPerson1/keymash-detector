@@ -5,3 +5,17 @@ edition = "2024"
 
 [dependencies]
 keymash-detector-core = { path = "../keymash-detector-core" }
+twitch_highway = { version = "0.3.2", features = [
+    "eventsub",
+    "websocket",
+    "websocket-client",
+    "websocket-router",
+    "users",
+    "chat",
+] }
+twitch_oauth_token = "3.0.0"
+tokio = { version = "*" }
+serde = "*"
+tracing = "*"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+toml = "0.9.8"
