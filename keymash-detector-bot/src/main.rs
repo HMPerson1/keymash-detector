@@ -1,13 +1,7 @@
-use std::{
-    collections::HashMap,
-    fs,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-};
+use std::{collections::HashMap, fs, ops::Deref, sync::Arc, time::Duration};
 
 use serde::{Deserialize, Serialize};
+use tokio::{join, sync::mpsc, time::Instant};
 use twitch_highway::{
     TwitchAPI,
     chat::{ChatAPI, SendChatMessageResponse},
@@ -26,24 +20,45 @@ const CONFIG_FILE_PATH: &str = "bot-config.toml";
 // twitch_highway does not forward twitch keepalives, so minimize them
 const TWITCH_EVENTSUB_WS_URL: &str =
     "wss://eventsub.wss.twitch.tv/ws?keepalive_timeout_seconds=600";
+// 20msg/30sec, plus some safety margin
+const MIN_CHAT_WAIT: Duration = Duration::from_millis(1_510);
 
-struct RunState {
+struct GlobalState {
     api_app: TwitchAPI,
     api_user: TwitchAPI,
     me_user: UserId,
-    rooms: HashMap<BroadcasterId, RoomRunState>,
+}
+
+struct RunState {
+    globals: Arc<GlobalState>,
+    rooms: Vec<BroadcasterId>,
+    chat_sender: mpsc::Sender<SendChatReq>,
+}
+
+impl Deref for RunState {
+    type Target = GlobalState;
+
+    fn deref(&self) -> &Self::Target {
+        self.globals.deref()
+    }
+}
+
+struct SendChatReq {
+    room_id: BroadcasterId,
+    msg: String,
+    reply_to_id: String,
 }
 
 struct RoomRunState {
-    has_bot_auth: AtomicBool,
-    duplicate_bypass_state: AtomicBool,
+    has_bot_auth: bool,
+    duplicate_bypass_state: bool,
 }
 
 impl From<RoomConfig> for RoomRunState {
     fn from(value: RoomConfig) -> Self {
         Self {
-            has_bot_auth: AtomicBool::new(value.has_bot_auth),
-            duplicate_bypass_state: AtomicBool::new(false),
+            has_bot_auth: value.has_bot_auth,
+            duplicate_bypass_state: false,
         }
     }
 }
@@ -55,9 +70,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     // TODO: refresh tokens as needed
-    let run_state = init().await?;
+    let config = init().await?;
 
-    {
+    let globals = Arc::new(GlobalState {
+        api_app: TwitchAPI::new(config.client.access_token, config.client.id.clone()),
+        api_user: TwitchAPI::new(config.bot_user.access_token, config.client.id),
+        me_user: UserId::from(config.bot_user.id),
+    });
+
+    let (tx, rx) = mpsc::channel(50);
+
+    let run_state = RunState {
+        globals: globals.clone(),
+        rooms: config.rooms.keys().cloned().collect(),
+        chat_sender: tx,
+    };
+
+    let sender_task = tokio::spawn(send_chat_loop(globals, config.rooms, rx));
+
+    let reader_task = tokio::spawn({
         use websocket::routes::*;
         websocket::client(
             TWITCH_EVENTSUB_WS_URL,
@@ -66,8 +97,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .route(channel_chat_message(on_message))
                 .with_state(Arc::new(run_state)),
         )
-        .await?;
-    }
+        .into_future()
+    });
+
+    let _ = join!(sender_task, reader_task);
 
     Ok(())
 }
@@ -98,7 +131,7 @@ struct RoomConfig {
     has_bot_auth: bool,
 }
 
-async fn init() -> Result<RunState, Box<dyn std::error::Error>> {
+async fn init() -> Result<Config, Box<dyn std::error::Error>> {
     #[derive(Deserialize)]
     struct ValidateAppToken {
         client_id: ClientId,
@@ -172,23 +205,14 @@ async fn init() -> Result<RunState, Box<dyn std::error::Error>> {
     };
     fs::write(CONFIG_FILE_PATH, toml::to_string(&new_config)?)?;
 
-    Ok(RunState {
-        api_app: TwitchAPI::new(new_config.client.access_token, client_id.clone()),
-        api_user: TwitchAPI::new(new_config.bot_user.access_token, client_id),
-        me_user: UserId::from(new_config.bot_user.id),
-        rooms: new_config
-            .rooms
-            .into_iter()
-            .map(|(k, v)| (k, v.into()))
-            .collect(),
-    })
+    Ok(new_config)
 }
 
 async fn on_welcome(
     extract::State(run_state): extract::State<Arc<RunState>>,
     extract::Session(session): extract::Session,
 ) {
-    for room_user in run_state.rooms.keys() {
+    for room_user in &run_state.rooms {
         tracing::info!("subscribing to room {}", room_user);
         let response = run_state
             .api_user
@@ -207,59 +231,85 @@ async fn on_message(
     extract::State(run_state): extract::State<Arc<RunState>>,
     extract::Event(event): extract::Event<ChannelChatMessage>,
 ) {
-    let room_id = &event.broadcaster_user_id;
-    let room_state = &run_state.rooms[room_id];
+    let room_id = event.broadcaster_user_id.clone();
 
-    if event.chatter_user_id == run_state.me_user {
-        tracing::debug!("ignored self-chat in room {}", room_id);
-        return;
-    }
-    tracing::debug!("recv chat in room {}: {}", room_id, event.message.text);
-
-    let duplicate_bypass_state = room_state.duplicate_bypass_state.load(Ordering::SeqCst);
-    let mut msg = "auto reply spam test".to_string();
-    if duplicate_bypass_state {
-        // from 7tv "Bypass Duplicate Message Check"
-        // chatterino apparently uses `'\u{E0000}'`
-        msg.push_str(" \u{34f}");
-    }
-
-    let do_send_chat = async |api: &TwitchAPI| {
-        api.send_chat_message(room_id, &run_state.me_user, &msg)
-            .reply_parent_message_id(&event.message_id)
-            .json()
-            .await
+    let msg = {
+        if event.chatter_user_id == run_state.me_user {
+            tracing::debug!("ignored self-chat in room {}", room_id);
+            return;
+        } else {
+            tracing::debug!("recv chat in room {}: {}", room_id, event.message.text);
+            "auto reply spam test".to_string()
+        }
     };
 
-    if room_state.has_bot_auth.load(Ordering::SeqCst) {
-        let response = do_send_chat(&run_state.api_app).await;
+    let enqueue_res = run_state.chat_sender.try_send({
+        SendChatReq {
+            room_id,
+            msg,
+            reply_to_id: event.message_id,
+        }
+    });
+    if let Err(e) = enqueue_res {
+        tracing::error!("failed to enqueue chat send: {}", e);
+    }
+}
+
+async fn send_chat_loop(
+    run_state: Arc<GlobalState>,
+    config_rooms: HashMap<BroadcasterId, RoomConfig>,
+    mut rx: mpsc::Receiver<SendChatReq>,
+) {
+    let mut rooms: HashMap<_, RoomRunState> = config_rooms
+        .into_iter()
+        .map(|(k, v)| (k, v.into()))
+        .collect();
+    let mut last_chat_send_attempt = Instant::now() - Duration::from_hours(1);
+
+    while let Some(mut req) = rx.recv().await {
+        let room_state = rooms.get_mut(&req.room_id).unwrap();
+
+        if room_state.duplicate_bypass_state {
+            // from 7tv "Bypass Duplicate Message Check"
+            // chatterino apparently uses `'\u{E0000}'`
+            req.msg.push_str(" \u{34f}");
+        }
+
+        let mut do_send_chat = async |api: &TwitchAPI| {
+            tokio::time::sleep_until(last_chat_send_attempt + MIN_CHAT_WAIT).await;
+            last_chat_send_attempt = Instant::now();
+            api.send_chat_message(&req.room_id, &run_state.me_user, &req.msg)
+                .reply_parent_message_id(&req.reply_to_id)
+                .json()
+                .await
+        };
+
+        if room_state.has_bot_auth {
+            let response = do_send_chat(&run_state.api_app).await;
+
+            if is_send_chat_sent(&response) {
+                room_state.duplicate_bypass_state = !room_state.duplicate_bypass_state;
+                tracing::debug!("chat reply sent as bot");
+                continue;
+            }
+            tracing::warn!("failed to send chat as bot: {:?}", &response);
+            if !is_send_chat_failed_bot_auth(&response) {
+                // don't retry for other errors
+                continue;
+            }
+            tracing::warn!("unsetting has_bot_auth and retrying...");
+            room_state.has_bot_auth = false;
+            // fallthrough to `has_bot_auth == false`
+        }
+
+        let response = do_send_chat(&run_state.api_user).await;
 
         if is_send_chat_sent(&response) {
-            room_state
-                .duplicate_bypass_state
-                .fetch_not(Ordering::SeqCst);
-            tracing::debug!("chat reply sent as bot");
-            return;
+            room_state.duplicate_bypass_state = !room_state.duplicate_bypass_state;
+            tracing::debug!("chat reply sent");
+        } else {
+            tracing::warn!("failed to send chat: {:?}", &response);
         }
-        tracing::warn!("failed to send chat as bot: {:?}", &response);
-        if !is_send_chat_failed_bot_auth(&response) {
-            // don't retry for other errors
-            return;
-        }
-        tracing::warn!("unsetting has_bot_auth and retrying...");
-        room_state.has_bot_auth.store(false, Ordering::SeqCst);
-        // fallthrough to `has_bot_auth == false`
-    }
-
-    let response = do_send_chat(&run_state.api_user).await;
-
-    if is_send_chat_sent(&response) {
-        room_state
-            .duplicate_bypass_state
-            .fetch_not(Ordering::SeqCst);
-        tracing::debug!("chat reply sent");
-    } else {
-        tracing::warn!("failed to send chat: {:?}", &response);
     }
 }
 
