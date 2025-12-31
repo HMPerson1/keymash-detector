@@ -1327,7 +1327,9 @@ dependencies = [
 name = "keymash-detector-bot"
 version = "0.1.0"
 dependencies = [
+ "asknothingx2-util",
  "keymash-detector-core",
+ "reqwest",
  "serde",
  "tokio",
  "toml",

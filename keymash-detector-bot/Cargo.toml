@@ -14,8 +14,10 @@ twitch_highway = { version = "0.3.2", features = [
     "chat",
 ] }
 twitch_oauth_token = "3.0.0"
+asknothingx2-util = "*"
 tokio = { version = "*" }
 serde = "*"
 tracing = "*"
+reqwest = "*"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 toml = "0.9.8"

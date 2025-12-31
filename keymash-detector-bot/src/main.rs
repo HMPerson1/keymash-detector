@@ -1,7 +1,11 @@
 use std::{collections::HashMap, fs, ops::Deref, sync::Arc, time::Duration};
 
 use serde::{Deserialize, Serialize};
-use tokio::{join, sync::mpsc, time::Instant};
+use tokio::{
+    join,
+    sync::{mpsc, watch},
+    time::Instant,
+};
 use twitch_highway::{
     TwitchAPI,
     chat::{ChatAPI, SendChatMessageResponse},
@@ -14,6 +18,7 @@ use twitch_highway::{
 };
 use twitch_oauth_token::{AccessToken, ClientId, ClientSecret, RefreshToken, TwitchOauth, scope};
 
+const HTTP_CLIENT_UA: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 // this is public
 const TWITCH_CLIENT_ID: &str = include_str!("CLIENT_ID").trim_ascii_end();
 const SECRETS_FILE_PATH: &str = "bot-secrets.toml";
@@ -24,14 +29,34 @@ const TWITCH_EVENTSUB_WS_URL: &str =
 // 20msg/30sec, plus some safety margin
 const MIN_CHAT_WAIT: Duration = Duration::from_millis(1_510);
 
+#[derive(Clone)]
 struct GlobalState {
-    api_app: TwitchAPI,
-    api_user: TwitchAPI,
-    me_user: UserId,
+    client_id: ClientId,
+    app_token: watch::Receiver<AccessToken>,
+    user_token: watch::Receiver<AccessToken>,
+    http_client: reqwest::Client,
+}
+
+impl GlobalState {
+    fn api_app(&self) -> TwitchAPI {
+        TwitchAPI::with_client(
+            self.app_token.borrow().clone(),
+            self.client_id.clone(),
+            self.http_client.clone(),
+        )
+    }
+    fn api_user(&self) -> TwitchAPI {
+        TwitchAPI::with_client(
+            self.user_token.borrow().clone(),
+            self.client_id.clone(),
+            self.http_client.clone(),
+        )
+    }
 }
 
 struct RunState {
-    globals: Arc<GlobalState>,
+    globals: GlobalState,
+    me_user: UserId,
     rooms: Vec<BroadcasterId>,
     chat_sender: mpsc::Sender<SendChatReq>,
 }
@@ -40,7 +65,7 @@ impl Deref for RunState {
     type Target = GlobalState;
 
     fn deref(&self) -> &Self::Target {
-        self.globals.deref()
+        &self.globals
     }
 }
 
@@ -70,26 +95,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter("info,twitch_highway=debug,keymash_detector_bot=trace")
         .init();
 
-    // TODO: refresh tokens as needed
-    let config = init().await?;
+    let secrets = validate_secrets().await?;
+    let me_user = UserId::from(secrets.bot_user.id);
 
-    let globals = Arc::new(GlobalState {
-        api_app: TwitchAPI::new(config.client.access_token, config.client.id.clone()),
-        api_user: TwitchAPI::new(config.bot_user.access_token, config.client.id),
-        me_user: UserId::from(config.bot_user.id),
-    });
+    let (app_token_tx, app_token_rx) = watch::channel(secrets.client.access_token);
+    let (user_token_tx, user_token_rx) = watch::channel(secrets.bot_user.access_token);
+    let validate_task = tokio::spawn(token_validate_loop(app_token_tx, user_token_tx));
+
+    let globals = GlobalState {
+        client_id: secrets.client.id,
+        app_token: app_token_rx,
+        user_token: user_token_rx,
+        http_client: asknothingx2_util::api::preset::rest_api(HTTP_CLIENT_UA).build_client()?,
+    };
 
     let config: Config = toml::from_str(&fs::read_to_string(CONFIG_FILE_PATH)?)?;
+    let rooms = config.0.keys().cloned().collect();
 
     let (tx, rx) = mpsc::channel(50);
 
+    let sender_task = tokio::spawn(send_chat_loop(
+        globals.clone(),
+        me_user.clone(),
+        config.0,
+        rx,
+    ));
+
     let run_state = RunState {
-        globals: globals.clone(),
-        rooms: config.0.keys().cloned().collect(),
+        globals,
+        me_user,
+        rooms,
         chat_sender: tx,
     };
-
-    let sender_task = tokio::spawn(send_chat_loop(globals, config.0, rx));
 
     let reader_task = tokio::spawn({
         use websocket::routes::*;
@@ -103,7 +140,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .into_future()
     });
 
-    let _ = join!(sender_task, reader_task);
+    let _ = join!(validate_task, sender_task, reader_task);
 
     Ok(())
 }
@@ -136,7 +173,35 @@ struct RoomConfig {
     has_bot_auth: bool,
 }
 
-async fn init() -> Result<Secrets, Box<dyn std::error::Error>> {
+#[tracing::instrument(skip_all)]
+async fn token_validate_loop(
+    app_token_out: watch::Sender<AccessToken>,
+    user_token_out: watch::Sender<AccessToken>,
+) {
+    let mut interval = tokio::time::interval(Duration::from_hours(1));
+    // skip initial tick since `main` validates secrets just before spawning this
+    interval.tick().await;
+
+    loop {
+        interval.tick().await;
+
+        // panic the whole process if we can't get access tokens
+        let secrets = validate_secrets().await.expect("bad secrets");
+
+        let send_res = app_token_out.send(secrets.client.access_token);
+        if send_res.is_err() {
+            break;
+        }
+        let send_res = user_token_out.send(secrets.bot_user.access_token);
+        if send_res.is_err() {
+            break;
+        }
+    }
+    tracing::error!("exiting loop due to closed channel");
+}
+
+async fn validate_secrets() -> Result<Secrets, Box<dyn std::error::Error>> {
+    tracing::info!("validating secrets...");
     let secrets: Secrets = toml::from_str(&fs::read_to_string(SECRETS_FILE_PATH)?)?;
 
     let client_id = ClientId::from(TWITCH_CLIENT_ID);
@@ -244,7 +309,7 @@ async fn on_welcome(
     for room_user in &run_state.rooms {
         tracing::info!("subscribing to room {}", room_user);
         let response = run_state
-            .api_user
+            .api_user()
             .websocket_subscription(SubscriptionType::ChannelChatMessage, session.id.clone())
             .broadcaster_user_id(room_user.clone())
             .user_id(run_state.me_user.clone())
@@ -285,7 +350,8 @@ async fn on_message(
 }
 
 async fn send_chat_loop(
-    run_state: Arc<GlobalState>,
+    run_state: GlobalState,
+    me_user: UserId,
     config_rooms: HashMap<BroadcasterId, RoomConfig>,
     mut rx: mpsc::Receiver<SendChatReq>,
 ) {
@@ -307,14 +373,14 @@ async fn send_chat_loop(
         let mut do_send_chat = async |api: &TwitchAPI| {
             tokio::time::sleep_until(last_chat_send_attempt + MIN_CHAT_WAIT).await;
             last_chat_send_attempt = Instant::now();
-            api.send_chat_message(&req.room_id, &run_state.me_user, &req.msg)
+            api.send_chat_message(&req.room_id, &me_user, &req.msg)
                 .reply_parent_message_id(&req.reply_to_id)
                 .json()
                 .await
         };
 
         if room_state.has_bot_auth {
-            let response = do_send_chat(&run_state.api_app).await;
+            let response = do_send_chat(&run_state.api_app()).await;
 
             if is_send_chat_sent(&response) {
                 room_state.duplicate_bypass_state = !room_state.duplicate_bypass_state;
@@ -331,7 +397,7 @@ async fn send_chat_loop(
             // fallthrough to `has_bot_auth == false`
         }
 
-        let response = do_send_chat(&run_state.api_user).await;
+        let response = do_send_chat(&run_state.api_user()).await;
 
         if is_send_chat_sent(&response) {
             room_state.duplicate_bypass_state = !room_state.duplicate_bypass_state;
