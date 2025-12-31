@@ -16,6 +16,7 @@ use twitch_oauth_token::{AccessToken, ClientId, ClientSecret, RefreshToken, Twit
 
 // this is public
 const TWITCH_CLIENT_ID: &str = include_str!("CLIENT_ID").trim_ascii_end();
+const SECRETS_FILE_PATH: &str = "bot-secrets.toml";
 const CONFIG_FILE_PATH: &str = "bot-config.toml";
 // twitch_highway does not forward twitch keepalives, so minimize them
 const TWITCH_EVENTSUB_WS_URL: &str =
@@ -78,15 +79,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         me_user: UserId::from(config.bot_user.id),
     });
 
+    let config: Config = toml::from_str(&fs::read_to_string(CONFIG_FILE_PATH)?)?;
+
     let (tx, rx) = mpsc::channel(50);
 
     let run_state = RunState {
         globals: globals.clone(),
-        rooms: config.rooms.keys().cloned().collect(),
+        rooms: config.0.keys().cloned().collect(),
         chat_sender: tx,
     };
 
-    let sender_task = tokio::spawn(send_chat_loop(globals, config.rooms, rx));
+    let sender_task = tokio::spawn(send_chat_loop(globals, config.0, rx));
 
     let reader_task = tokio::spawn({
         use websocket::routes::*;
@@ -105,107 +108,133 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[derive(PartialEq, Eq, Serialize, Deserialize)]
-struct Config {
-    client: ClientConfig,
-    bot_user: UserConfig,
-    rooms: HashMap<BroadcasterId, RoomConfig>,
+#[derive(Serialize, Deserialize)]
+struct Secrets {
+    client: ClientSecrets,
+    bot_user: UserSecrets,
 }
 
-#[derive(PartialEq, Eq, Serialize, Deserialize)]
-struct ClientConfig {
+#[derive(Serialize, Deserialize)]
+struct ClientSecrets {
     id: ClientId,
     secret: ClientSecret,
     access_token: AccessToken,
 }
 
-#[derive(PartialEq, Eq, Serialize, Deserialize)]
-struct UserConfig {
+#[derive(Serialize, Deserialize)]
+struct UserSecrets {
     id: String,
     refresh_token: RefreshToken,
     access_token: AccessToken,
 }
 
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
+struct Config(HashMap<BroadcasterId, RoomConfig>);
+
+#[derive(Serialize, Deserialize)]
 struct RoomConfig {
     has_bot_auth: bool,
 }
 
-async fn init() -> Result<Config, Box<dyn std::error::Error>> {
+async fn init() -> Result<Secrets, Box<dyn std::error::Error>> {
+    let secrets: Secrets = toml::from_str(&fs::read_to_string(SECRETS_FILE_PATH)?)?;
+
+    let client_id = ClientId::from(TWITCH_CLIENT_ID);
+    assert!(secrets.client.id == client_id);
+    let oauth = TwitchOauth::from_credentials(client_id.clone(), secrets.client.secret.clone());
+
+    let app_token = validate_app_token(&client_id, &oauth, secrets.client.access_token).await?;
+
+    let bot_user_id = secrets.bot_user.id.clone();
+    let (user_refresh_token, user_token) =
+        validate_user_token(&client_id, &oauth, secrets.bot_user).await?;
+
+    let new_secrets = Secrets {
+        client: ClientSecrets {
+            access_token: app_token,
+            ..secrets.client
+        },
+        bot_user: UserSecrets {
+            id: bot_user_id,
+            refresh_token: user_refresh_token,
+            access_token: user_token,
+        },
+    };
+    fs::write(SECRETS_FILE_PATH, toml::to_string(&new_secrets)?)?;
+
+    Ok(new_secrets)
+}
+
+#[tracing::instrument(skip_all)]
+async fn validate_app_token(
+    client_id: &ClientId,
+    oauth: &TwitchOauth,
+    app_token: AccessToken,
+) -> Result<AccessToken, Box<dyn std::error::Error>> {
     #[derive(Deserialize)]
     struct ValidateAppToken {
         client_id: ClientId,
-        // expires_in: u64,
+        expires_in: u64,
     }
-
-    let config: Config = toml::from_str(&fs::read_to_string(CONFIG_FILE_PATH)?)?;
-
-    let client_id = ClientId::from(TWITCH_CLIENT_ID);
-    assert!(config.client.id == client_id);
-    let oauth = TwitchOauth::from_credentials(client_id.clone(), config.client.secret.clone());
-
-    let app_valid = oauth
-        .validate_access_token(&config.client.access_token)
-        .await;
-    let app_token = match app_valid {
+    let app_valid = oauth.validate_access_token(&app_token).await;
+    match app_valid {
         Ok(app_valid) => {
-            tracing::debug!("stored app access token was valid");
+            tracing::debug!("stored access token was valid");
             let app_valid: ValidateAppToken = app_valid.json().await?;
-            assert!(app_valid.client_id == client_id);
-            config.client.access_token
+            assert!(app_valid.client_id == *client_id);
+            let expires_in = Duration::from_secs(app_valid.expires_in);
+            if expires_in > Duration::from_hours(4) {
+                return Ok(app_token);
+            }
+            tracing::info!("access token expires soon: {:?}", expires_in);
         }
         Err(e) => {
-            tracing::info!("stored app access token was invalid; re-authing...");
+            tracing::info!("stored access token was invalid");
             tracing::debug!("validate response: {:?}", e);
-            let app_token = oauth.app_access_token().await?.app_token();
-            app_token.await?.access_token
         }
-    };
+    }
+    tracing::info!("reauthing...");
+    let app_token = oauth.app_access_token().await?.app_token();
+    Ok(app_token.await?.access_token)
+}
 
+#[tracing::instrument(skip_all)]
+async fn validate_user_token(
+    client_id: &ClientId,
+    oauth: &TwitchOauth,
+    config_user: UserSecrets,
+) -> Result<(RefreshToken, AccessToken), Box<dyn std::error::Error>> {
     let check_user_info = |user_valid: twitch_oauth_token::ValidateToken| {
-        assert!(user_valid.client_id == client_id);
-        assert!(user_valid.user_id == config.bot_user.id);
+        assert!(user_valid.client_id == *client_id);
+        assert!(user_valid.user_id == config_user.id);
         assert!(user_valid.scopes.contains(&scope::Scope::UserBot));
     };
-
-    let user_valid = oauth
-        .validate_access_token(&config.bot_user.access_token)
-        .await;
-    let (user_refresh_token, user_token) = match user_valid {
+    let user_valid = oauth.validate_access_token(&config_user.access_token).await;
+    match user_valid {
         Ok(user_valid) => {
-            tracing::debug!("stored user access token was valid");
-            check_user_info(user_valid.validate_token().await?);
-            (config.bot_user.refresh_token, config.bot_user.access_token)
+            tracing::debug!("stored access token was valid");
+            let user_valid = user_valid.validate_token().await?;
+            let expires_in = Duration::from_secs(user_valid.expires_in);
+            check_user_info(user_valid);
+            if expires_in > Duration::from_mins(90) {
+                return Ok((config_user.refresh_token, config_user.access_token));
+            }
+            tracing::info!("access token expires soon: {:?}", expires_in);
         }
         Err(e) => {
-            tracing::info!("stored user access token was invalid; refreshing...");
+            tracing::info!("stored access token was invalid");
             tracing::debug!("validate response: {:?}", e);
-            let user_token = oauth.refresh_access_token(config.bot_user.refresh_token.clone());
-            let user_token = user_token.await?.user_token().await?;
-            if user_token.refresh_token != config.bot_user.refresh_token {
-                tracing::info!("refresh token changed")
-            }
-            let user_valid = oauth.validate_access_token(&user_token.access_token);
-            check_user_info(user_valid.await?.validate_token().await?);
-            (user_token.refresh_token, user_token.access_token)
         }
     };
-
-    let new_config = Config {
-        client: ClientConfig {
-            access_token: app_token,
-            ..config.client
-        },
-        bot_user: UserConfig {
-            refresh_token: user_refresh_token,
-            access_token: user_token,
-            ..config.bot_user
-        },
-        rooms: config.rooms,
-    };
-    fs::write(CONFIG_FILE_PATH, toml::to_string(&new_config)?)?;
-
-    Ok(new_config)
+    tracing::info!("refreshing...");
+    let user_token = oauth.refresh_access_token(config_user.refresh_token.clone());
+    let user_token = user_token.await?.user_token().await?;
+    if user_token.refresh_token != config_user.refresh_token {
+        tracing::info!("refresh token changed")
+    }
+    let user_valid = oauth.validate_access_token(&user_token.access_token);
+    check_user_info(user_valid.await?.validate_token().await?);
+    return Ok((user_token.refresh_token, user_token.access_token));
 }
 
 async fn on_welcome(
