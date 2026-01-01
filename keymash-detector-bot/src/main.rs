@@ -58,7 +58,7 @@ impl GlobalState {
 struct RunState {
     globals: GlobalState,
     me_user: UserId,
-    rooms: HashMap<BroadcasterId, tracing::Span>,
+    rooms: HashMap<BroadcasterId, (tracing::Span, RoomConfig)>,
     chat_sender: mpsc::Sender<SendChatReq>,
 }
 
@@ -70,31 +70,10 @@ impl Deref for RunState {
     }
 }
 
-struct SendChatReq {
-    span: tracing::Span,
-    room_id: BroadcasterId,
-    msg: String,
-    reply_to_id: String,
-}
-
-struct RoomRunState {
-    has_bot_auth: bool,
-    duplicate_bypass_state: bool,
-}
-
-impl From<RoomConfig> for RoomRunState {
-    fn from(value: RoomConfig) -> Self {
-        Self {
-            has_bot_auth: value.has_bot_auth,
-            duplicate_bypass_state: false,
-        }
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::fmt()
-        .with_env_filter("info,twitch_highway=debug,keymash_detector_bot=trace")
+        .with_env_filter("info,wolfe_bfgs=warn,twitch_highway=debug,keymash_detector_bot=trace")
         .init();
 
     let secrets = validate_secrets().await?;
@@ -112,25 +91,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let config: Config = toml::from_str(&fs::read_to_string(CONFIG_FILE_PATH)?)?;
-    let rooms: HashMap<_, _> = config
-        .0
-        .keys()
-        .map(|k| (k.clone(), tracing::info_span!("room", id = &**k)))
-        .collect();
 
     let (tx, rx) = mpsc::channel(50);
 
     let sender_task = tokio::spawn(send_chat_loop(
         globals.clone(),
         me_user.clone(),
-        config.0,
+        config
+            .0
+            .iter()
+            .map(|(k, v)| (k.clone(), v.into()))
+            .collect(),
         rx,
     ));
 
     let run_state = RunState {
         globals,
         me_user,
-        rooms,
+        rooms: config
+            .0
+            .into_iter()
+            .map(|(k, v)| ((tracing::info_span!("room", id = &*k), v), k))
+            .map(|(v, k)| (k, v))
+            .collect(),
         chat_sender: tx,
     };
 
@@ -177,6 +160,9 @@ struct Config(HashMap<BroadcasterId, RoomConfig>);
 #[derive(Serialize, Deserialize)]
 struct RoomConfig {
     has_bot_auth: bool,
+    keymash_threshold: f64,
+    message: String,
+    reply: bool,
 }
 
 #[tracing::instrument(skip_all)]
@@ -312,7 +298,7 @@ async fn on_welcome(
     extract::State(run_state): extract::State<Arc<RunState>>,
     extract::Session(session): extract::Session,
 ) {
-    for (room_id, span) in &run_state.rooms {
+    for (room_id, (span, _)) in &run_state.rooms {
         async {
             tracing::info!("subscribing...");
             let response = run_state
@@ -331,32 +317,39 @@ async fn on_welcome(
     }
 }
 
+struct SendChatReq {
+    span: tracing::Span,
+    room_id: BroadcasterId,
+    msg: String,
+    reply_to_id: Option<String>,
+}
+
 async fn on_message(
     extract::State(run_state): extract::State<Arc<RunState>>,
     extract::Event(event): extract::Event<ChannelChatMessage>,
 ) {
     let room_id = event.broadcaster_user_id.clone();
-    let room_span = &run_state.rooms[&room_id];
+    let (room_span, room_config) = &run_state.rooms[&room_id];
     {
         let entered_span = tracing::info_span!(parent: room_span, "recv").entered();
 
-        let msg = {
-            if event.chatter_user_id == run_state.me_user {
-                tracing::debug!("ignored self-chat");
-                return;
-            } else {
-                tracing::debug!("chat: {}", event.message.text);
-                "auto reply spam test".to_string()
-            }
-        };
+        if event.chatter_user_id == run_state.me_user {
+            tracing::debug!("ignored self-chat");
+            return;
+        }
+        tracing::debug!("chat: {}", event.message.text);
+        if !keymash_detector_bot::has_keymash(room_config.keymash_threshold, event.message) {
+            return;
+        }
 
+        tracing::debug!("enqueueing chat...");
         let span = tracing::info_span!(parent: room_span, "send");
         span.follows_from(&entered_span);
         let enqueue_res = run_state.chat_sender.try_send(SendChatReq {
             span,
             room_id,
-            msg,
-            reply_to_id: event.message_id,
+            msg: room_config.message.clone(),
+            reply_to_id: room_config.reply.then_some(event.message_id),
         });
         if let Err(e) = enqueue_res {
             tracing::error!("failed to enqueue chat send: {}", e);
@@ -364,16 +357,26 @@ async fn on_message(
     }
 }
 
+struct RoomRunState {
+    has_bot_auth: bool,
+    duplicate_bypass_state: bool,
+}
+
+impl From<&RoomConfig> for RoomRunState {
+    fn from(value: &RoomConfig) -> Self {
+        Self {
+            has_bot_auth: value.has_bot_auth,
+            duplicate_bypass_state: false,
+        }
+    }
+}
+
 async fn send_chat_loop(
     run_state: GlobalState,
     me_user: UserId,
-    config_rooms: HashMap<BroadcasterId, RoomConfig>,
+    mut rooms: HashMap<BroadcasterId, RoomRunState>,
     mut rx: mpsc::Receiver<SendChatReq>,
 ) {
-    let mut rooms: HashMap<_, RoomRunState> = config_rooms
-        .into_iter()
-        .map(|(k, v)| (k, v.into()))
-        .collect();
     let mut last_chat_send_attempt = Instant::now() - Duration::from_hours(1);
 
     while let Some(mut req) = rx.recv().await {
@@ -389,10 +392,11 @@ async fn send_chat_loop(
             let mut do_send_chat = async |api: &TwitchAPI| {
                 tokio::time::sleep_until(last_chat_send_attempt + MIN_CHAT_WAIT).await;
                 last_chat_send_attempt = Instant::now();
-                api.send_chat_message(&req.room_id, &me_user, &req.msg)
-                    .reply_parent_message_id(&req.reply_to_id)
-                    .json()
-                    .await
+                let mut twitch_req = api.send_chat_message(&req.room_id, &me_user, &req.msg);
+                if let Some(reply_id) = &req.reply_to_id {
+                    twitch_req = twitch_req.reply_parent_message_id(reply_id)
+                }
+                twitch_req.json().await
             };
 
             if room_state.has_bot_auth {
