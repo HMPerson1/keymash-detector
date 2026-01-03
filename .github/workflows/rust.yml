@@ -1,0 +1,27 @@
+name: Rust
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+    - uses: actions/checkout@v4
+    - run: echo "$TWITCH_CLIENT_ID" > "keymash-detector-bot/src/CLIENT_ID"
+      env:
+        TWITCH_CLIENT_ID: ${{ vars.TWITCH_CLIENT_ID }}
+    - name: Build
+      run: cargo build --verbose --release
+    - uses: actions/upload-artifact@v6
+      with:
+        name: keymash-detector-bot
+        path: target/release/keymash-detector-bot
