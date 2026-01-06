@@ -26,6 +26,9 @@ module.exports = {
       },
     ],
   },
+  experiments: {
+    asyncWebAssembly: true,
+  },
   optimization: {
     minimize: true,
 

@@ -1,5 +1,7 @@
 {
     "compilerOptions": {
+        "strict": true,
+        "resolveJsonModule": true,
         "outDir": "./dist/",
         "target": "ES2022",
         "module": "CommonJS",
