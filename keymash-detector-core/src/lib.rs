@@ -1,6 +1,7 @@
 mod data;
 
 use dfdx_core::prelude::*;
+use errorfunctions::RealErrorFunctions;
 use wolfe_bfgs::*;
 
 const HAND_BLOB_RADIUS_MIN: f64 = 1.;
@@ -132,7 +133,7 @@ fn norm_logcdf<S: Shape, T: Tape<f64, Cpu>>(x: Tensor<S, f64, Cpu, T>) -> Tensor
 
         #[inline(always)]
         fn f(&self, x: &f64) -> f64 {
-            xsf::log_ndtr(*x)
+            log_ndtr(*x)
         }
 
         #[inline(always)]
@@ -142,6 +143,19 @@ fn norm_logcdf<S: Shape, T: Tape<f64, Cpu>>(x: Tensor<S, f64, Cpu, T>) -> Tensor
         }
     }
     try_unary_op2(NormLogCdfOp, x).unwrap()
+}
+
+fn log_ndtr(x: f64) -> f64 {
+    #![allow(unstable_name_collisions)]
+    use std::f64::consts::FRAC_1_SQRT_2;
+
+    // https://github.com/scipy/xsf/blob/v0.1.5/include/xsf/stats.h#L88
+    let t = x * FRAC_1_SQRT_2;
+    if x < -1.0 {
+        ((-t).erfcx() / 2.).ln() - t * t
+    } else {
+        ((-t.erfc()) / 2.).ln_1p()
+    }
 }
 
 fn norm_logpdf<S: Shape, T: Tape<f64, Cpu>>(x: Tensor<S, f64, Cpu, T>) -> Tensor<S, f64, Cpu, T> {
@@ -163,7 +177,7 @@ fn logaddexp<S: Shape, T1: Tape<f64, Cpu> + Merge<T2>, T2: Tape<f64, Cpu>>(
 
         #[inline(always)]
         fn f(&self, x: &f64, y: &f64) -> f64 {
-            xsf::logaddexp(*x, *y)
+            logaddexp_f64(*x, *y)
         }
 
         #[inline(always)]
@@ -172,6 +186,27 @@ fn logaddexp<S: Shape, T1: Tape<f64, Cpu> + Merge<T2>, T2: Tape<f64, Cpu>>(
         }
     }
     try_binary_op2(LogAddExpOp, a, b).unwrap()
+}
+
+fn logaddexp_f64(x: f64, y: f64) -> f64 {
+    use std::f64::consts::LN_2;
+
+    // https://github.com/jorenham/xsf-rust/blob/v0.3.5/src/numpy/npymath.rs#L35
+    #[allow(clippy::float_cmp)]
+    if x == y {
+        // Handles infinities of the same sign without warnings
+        x + LN_2
+    } else {
+        let tmp = x - y;
+        if tmp > 0.0 {
+            x + (-tmp).exp().ln_1p()
+        } else if tmp <= 0.0 {
+            y + tmp.exp().ln_1p()
+        } else {
+            // NaNs
+            tmp
+        }
+    }
 }
 
 pub fn eval_english_model(input: &[u8]) -> f64 {
@@ -192,7 +227,7 @@ pub fn eval_english_model(input: &[u8]) -> f64 {
             };
             (v, &data::ENGLISH_LETTER_FREQ)
         };
-        ret += xsf::logaddexp(v + (-PRB_MISTAKE).ln_1p(), PRB_MISTAKE.ln());
+        ret += logaddexp_f64(v + (-PRB_MISTAKE).ln_1p(), PRB_MISTAKE.ln());
         prev = prev_n;
     }
     return ret;
