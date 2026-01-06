@@ -1,11 +1,3 @@
 [workspace]
 resolver = "3"
 members = ["keymash-detector-core", "keymash-detector-bot", "keymash-detector-firebot-custom-script/core"]
-
-[profile.test]
-opt-level = 1
-
-[profile.release]
-panic = "abort"
-lto = "fat"
-opt-level = "z"
