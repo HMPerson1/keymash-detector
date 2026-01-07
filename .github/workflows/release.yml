@@ -42,7 +42,7 @@ jobs:
         name: custom-script
         path: tmp-dist
     - name: Create release
-      run: gh release create --notes-from-tag --prerelease "${{ github.ref_name }}" "${{ steps.artifact_download.outputs.download-path }}/*"
+      run: gh release create --notes-from-tag "${{ github.ref_name }}" "${{ steps.artifact_download.outputs.download-path }}/*"
       env:
         GH_TOKEN: ${{ github.token }}
       
