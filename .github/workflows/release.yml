@@ -1,0 +1,48 @@
+name: Release Firebot Custom Script
+
+on:
+  push:
+    tags:
+    - "**"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+    - name: Install wasm-pack
+      run: curl https://drager.github.io/wasm-pack/installer/init.sh -sSf | bash
+    - uses: actions/checkout@v4
+    - run: wasm-pack build
+      working-directory: "keymash-detector-firebot-custom-script/core"
+      env:
+        RUST_LOG: info
+    - run: npm ci
+      working-directory: "keymash-detector-firebot-custom-script"
+    - run: npm run build
+      working-directory: "keymash-detector-firebot-custom-script"
+    - uses: actions/upload-artifact@v6
+      with:
+        name: custom-script
+        path: keymash-detector-firebot-custom-script/dist/
+  release:
+    runs-on: ubuntu-slim
+    needs: [ build ]
+    permissions:
+      contents: write
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        ref: ${{ github.ref }}
+        sparse-checkout: ''
+    - id: artifact_download
+      uses: actions/download-artifact@v7
+      with:
+        name: custom-script
+        path: tmp-dist
+    - name: Create release
+      run: gh release create --notes-from-tag --prerelease "${{ github.ref_name }}" "${{ steps.artifact_download.outputs.download-path }}/*"
+      env:
+        GH_TOKEN: ${{ github.token }}
+      
