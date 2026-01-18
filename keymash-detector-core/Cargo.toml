@@ -4,15 +4,18 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-dfdx-core = { git = "https://github.com/HMPerson1/dfdx.git", rev = "cb9242673a53254392533b4c4fda8e99031a967f", default-features = false }
+dfdx-core = { git = "https://github.com/HMPerson1/dfdx.git", rev = "e244726ff589f7a44776506e688d8c766fb5f071", default-features = false }
 errorfunctions = "0.2.0"
-wolfe_bfgs = "0.1.6"
-ndarray = "0.16.1"
+wolfe_bfgs = { git = "https://github.com/HMPerson1/wolfe_bfgs.git", rev = "6f93af47b8b6b30db3b474585e95936bd46cd9ae" }
+ndarray = "0.17.1"
 bytemuck = { version = "1.24.0", features = [
     "min_const_generics",
     "must_cast",
 ] }
 log = "*"
+bumpalo = { version = "3.19.1", default-features = false, features = [
+    "allocator_api",
+] }
 
 [dev-dependencies]
 env_logger = "0.11.8"

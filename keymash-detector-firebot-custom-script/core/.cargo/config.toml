@@ -1,4 +1,7 @@
+[build]
+rustflags = ["-Ctarget-feature=+simd128,+relaxed-simd"]
+
 [profile.release]
 panic = "abort"
 lto = "fat"
-opt-level = "z"
+opt-level = 3

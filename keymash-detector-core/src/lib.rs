@@ -1,4 +1,8 @@
+#![feature(allocator_api)]
+
 mod data;
+
+use std::alloc::Allocator;
 
 use dfdx_core::prelude::*;
 use errorfunctions::RealErrorFunctions;
@@ -21,13 +25,19 @@ pub fn fit_keymash_model(input: &[u8]) -> f64 {
         })
         .collect::<Vec<_>>();
 
-    let dev = Cpu::default();
-    let char_kb_map = dev.tensor(data::QWERTY_CHAR_KB_MAP_DATA_ARR);
+    // 1 MiB ought to be enough for anybody ;)
+    let mut alloc = bumpalo::Bump::with_capacity(1024 * 1024);
+    alloc.set_allocation_limit(Some(1024 * 1024));
 
     let opt_res = Bfgs::new(
         ndarray::array![1.75, 1.1, 4.75, 0.9, 1., 7.75, 0.9, 10.75, 1.1, 1.],
-        |params| {
-            let params: Tensor<Rank1<10>, _, _> = dev.tensor(params.to_vec());
+        move |params| {
+            alloc.reset();
+            let dev = Cpu::with_allocator(&alloc);
+            let char_kb_map = dev.tensor(data::QWERTY_CHAR_KB_MAP_DATA_ARR);
+            let input = dev.tensor((&input[..], (input.len(),)));
+
+            let params: Tensor<Rank1<10>, _, _> = dev.tensor(&params.to_vec()[..]);
             let params = params.leaky_traced();
 
             let l0 = params.c().slice((0..2,)).realize::<Rank1<2>>();
@@ -37,16 +47,16 @@ pub fn fit_keymash_model(input: &[u8]) -> f64 {
             let r1 = params.c().slice((7..9,)).realize::<Rank1<2>>();
             let rr = params.c().select::<Rank0, _>(dev.tensor(9));
 
-            let lr = logaddexp(lr, dev.tensor(HAND_BLOB_RADIUS_MIN));
-            let rr = logaddexp(rr, dev.tensor(HAND_BLOB_RADIUS_MIN));
+            let params = params.ghost();
+
+            let r_min = dev.tensor(HAND_BLOB_RADIUS_MIN);
+            let lr = logaddexp(lr, r_min.clone());
+            let rr = logaddexp(rr, r_min);
 
             let (lh_map, llen_ll) = mk_hand_blob(&dev, l0, l1, lr, char_kb_map.clone());
             let (rh_map, rlen_ll) = mk_hand_blob(&dev, r0, r1, rr, char_kb_map.clone());
 
-            let len = input.len();
-            let input = dev.tensor((input.clone(), (len,)));
-
-            let ret = logaddexp(lh_map.gather(input.clone()), rh_map.gather(input));
+            let ret = logaddexp(lh_map.gather(input.clone()), rh_map.gather(input.clone()));
             let ret = ret + ((1. - KEYMASH_MISTAKE_P) / 2.).ln();
             let tmp = dev.tensor(KEYMASH_MISTAKE_P.ln()).broadcast_like(&ret);
             let ret = logaddexp(ret, tmp);
@@ -74,6 +84,8 @@ fn extract_soln(opt_res: Result<BfgsSolution, BfgsError>) -> Option<BfgsSolution
             BfgsError::MaxIterationsReached { last_solution } => Some(*last_solution),
             BfgsError::GradientIsNaN => None,
             BfgsError::StepSizeTooSmall => None,
+            BfgsError::InvalidBounds { message } => unreachable!("invalid bounds: {}", message),
+            BfgsError::InternalInvariant { .. } => None,
         },
     }
 }
@@ -86,13 +98,20 @@ trait WithEmptyTapeShort: WithEmptyTape + Sized {
 }
 impl<T: WithEmptyTape> WithEmptyTapeShort for T {}
 
-fn mk_hand_blob<T: Tape<f64, Cpu> + std::fmt::Debug>(
-    dev: &Cpu,
-    p0: Tensor<Rank1<2>, f64, Cpu, T>,
-    p1: Tensor<Rank1<2>, f64, Cpu, T>,
-    r: Tensor<Rank0, f64, Cpu, T>,
-    char_kb_map: Tensor<Rank2<47, 2>, f64, Cpu, NoneTape>,
-) -> (Tensor<(usize,), f64, Cpu, T>, Tensor<Rank0, f64, Cpu, T>) {
+fn mk_hand_blob<
+    'a,
+    T: Tape<'a, f64, Cpu<A>> + std::fmt::Debug,
+    A: Allocator + Clone + std::fmt::Debug + 'a,
+>(
+    dev: &Cpu<A>,
+    p0: Tensor<Rank1<2>, f64, Cpu<A>, T>,
+    p1: Tensor<Rank1<2>, f64, Cpu<A>, T>,
+    r: Tensor<Rank0, f64, Cpu<A>, T>,
+    char_kb_map: Tensor<Rank2<47, 2>, f64, Cpu<A>, NoneTape>,
+) -> (
+    Tensor<(usize,), f64, Cpu<A>, T>,
+    Tensor<Rank0, f64, Cpu<A>, T>,
+) {
     let p10 = p1.c() - p0.c();
     let l2 = p10.c().square().sum();
     let p0map = p0.c().broadcast() - char_kb_map.clone();
@@ -123,7 +142,9 @@ fn mk_hand_blob<T: Tape<f64, Cpu> + std::fmt::Debug>(
     )
 }
 
-fn norm_logcdf<S: Shape, T: Tape<f64, Cpu>>(x: Tensor<S, f64, Cpu, T>) -> Tensor<S, f64, Cpu, T> {
+fn norm_logcdf<'a, S: Shape, T: Tape<'a, f64, Cpu<A>>, A: Allocator + Clone + 'a>(
+    x: Tensor<S, f64, Cpu<A>, T>,
+) -> Tensor<S, f64, Cpu<A>, T> {
     use dfdx_core::tensor_ops::*;
     #[derive(Clone)]
     struct NormLogCdfOp;
@@ -158,15 +179,23 @@ fn log_ndtr(x: f64) -> f64 {
     }
 }
 
-fn norm_logpdf<S: Shape, T: Tape<f64, Cpu>>(x: Tensor<S, f64, Cpu, T>) -> Tensor<S, f64, Cpu, T> {
+fn norm_logpdf<'a, S: Shape, T: Tape<'a, f64, D>, D: Device<f64> + 'a>(
+    x: Tensor<S, f64, D, T>,
+) -> Tensor<S, f64, D, T> {
     use std::f64::consts::PI;
     -x.square() / 2. - (2. * PI).sqrt().ln()
 }
 
-fn logaddexp<S: Shape, T1: Tape<f64, Cpu> + Merge<T2>, T2: Tape<f64, Cpu>>(
-    a: Tensor<S, f64, Cpu, T1>,
-    b: Tensor<S, f64, Cpu, T2>,
-) -> Tensor<S, f64, Cpu, T1> {
+fn logaddexp<
+    'a,
+    S: Shape,
+    T1: Tape<'a, f64, Cpu<A>> + Merge<T2>,
+    T2: Tape<'a, f64, Cpu<A>>,
+    A: Allocator + Clone + 'a,
+>(
+    a: Tensor<S, f64, Cpu<A>, T1>,
+    b: Tensor<S, f64, Cpu<A>, T2>,
+) -> Tensor<S, f64, Cpu<A>, T1> {
     use dfdx_core::tensor_ops::*;
     #[derive(Clone, Debug)]
     struct LogAddExpOp;
