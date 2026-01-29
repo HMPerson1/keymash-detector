@@ -3,7 +3,7 @@
   "scriptOutputName": "keymashDetector",
   "version": "0.1",
   "description": "Adds a new event filter for chat messages containing keymashes and a new replace variable that computes keymash scores.",
-  "homepage": "https://github.com/HMPerson1/keymash-detector#readme-ov-file",
+  "homepage": "https://github.com/HMPerson1/keymash-detector/wiki/Firebot-Custom-Script-Usage",
   "main": "",
   "scripts": {
     "build": "webpack",
